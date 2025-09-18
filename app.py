@@ -32,6 +32,9 @@ import re
 
 # --- NetCDF / xarray support (paste here) ---
 import xarray as xr
+import subprocess
+import tempfile
+
 from netCDF4 import Dataset
 import os
 # xarray uses numpy already imported in file
@@ -373,6 +376,99 @@ def plot_variable_timeseries_at_point(ds, var="temperature", lon_val=None, lat_v
     _style_plotly_light(fig)
     return fig
 
+# ---------------- CMEMS: motuclient download helper ----------------
+def fetch_cmems_via_motu(username: str, password: str, bbox: dict, start_date: str, end_date: str,
+                         variables: list = ("thetao", "so"), product_id: str = "global-analysis-forecast-phy-001-024-hourly-t-u-v-ssh",
+                         service_id: str = "GLOBAL_ANALYSISFORECAST_PHY_001_024-TDS", motu_base: str = "https://nrt.cmems-du.eu/motu-web/Motu"):
+    """
+    Download a small CMEMS subset via motuclient CLI and return an xarray.Dataset.
+    - username/password: your CMEMS credentials
+    - bbox: dict with keys lonmin, lonmax, latmin, latmax
+    - start_date, end_date: ISO strings "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD"
+    - variables: list of variable names (e.g. ['thetao','so'])
+    Returns xarray.Dataset or raises an exception.
+    NOTE: requires motuclient installed (`pip install motuclient`) and a working CMEMS account.
+    """
+    try:
+        import xarray as _xr
+    except Exception as e:
+        raise RuntimeError("xarray is required to load the downloaded CMEMS NetCDF: " + str(e))
+
+    # defensive check: bbox keys
+    try:
+        lonmin = float(bbox["lonmin"]); lonmax = float(bbox["lonmax"])
+        latmin = float(bbox["latmin"]); latmax = float(bbox["latmax"])
+    except Exception:
+        raise ValueError("bbox must be a dict containing numeric lonmin, lonmax, latmin, latmax")
+
+    # prepare a temporary output file
+    tmpf = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
+    tmpf_name = tmpf.name
+    tmpf.close()
+
+    # Build motuclient command (CLI). Using --user/--pwd for auth.
+    cmd = [
+        sys.executable, "-m", "motuclient",
+        "--motu", motu_base,
+        "--service-id", service_id,
+        "--product-id", product_id,
+        "--longitude-min", str(lonmin),
+        "--longitude-max", str(lonmax),
+        "--latitude-min", str(latmin),
+        "--latitude-max", str(latmax),
+        "--date-min", str(start_date),
+        "--date-max", str(end_date),
+        "--out-dir", os.path.dirname(tmpf_name),
+        "--out-name", os.path.basename(tmpf_name),
+        "--user", username,
+        "--pwd", password,
+    ]
+
+    # set a small depth window (user can change this later) -- optional, but many products require depth
+    # Note: comment/uncomment or change the following two lines depending on the product needs
+    # cmd += ["--depth-min", "0.0", "--depth-max", "0.5"]
+
+    # add variable flags
+    for v in variables:
+        cmd.extend(["--variable", v])
+
+    # run motuclient (this may take a few seconds)
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    except FileNotFoundError:
+        # motuclient not installed
+        raise RuntimeError("motuclient is not installed in this environment. Install it with `pip install motuclient`")
+    except subprocess.CalledProcessError as e:
+        # capture stderr to help debugging
+        raise RuntimeError(f"motuclient call failed: {e.stderr.decode('utf-8', errors='ignore') if getattr(e,'stderr',None) else str(e)}")
+    except Exception as e:
+        raise RuntimeError(f"motuclient call failed: {e}")
+
+    # Load with xarray
+    try:
+        ds = _xr.open_dataset(tmpf_name, decode_times=True, use_cftime=False)
+    except Exception as e:
+        # try forcing engine='netcdf4' as fallback
+        try:
+            ds = _xr.open_dataset(tmpf_name, engine="netcdf4")
+        except Exception as e2:
+            raise RuntimeError(f"Failed to open downloaded CMEMS file: {e}; fallback also failed: {e2}")
+
+    # Normalize coords if needed (many CMEMS products use 'longitude'/'latitude' or 'lon'/'lat')
+    try:
+        if "longitude" in ds.coords and "lon" not in ds.coords:
+            ds = ds.rename({"longitude": "lon"})
+        if "latitude" in ds.coords and "lat" not in ds.coords:
+            ds = ds.rename({"latitude": "lat"})
+    except Exception:
+        # non-fatal
+        pass
+
+    return ds
+# ---------------- end CMEMS helper ----------------
+
+
+
 
 def safe_rerun():
     """
@@ -687,6 +783,75 @@ with st.sidebar:
         nc_nt = st.number_input("Time steps (nt)", min_value=1, max_value=48, value=12)
         nc_depths_str = st.text_input("Depths (comma-separated, meters)", value="0,10,20,50,100,200")
         nc_vars = st.multiselect("Variables", ["temperature","salinity","oxygen","nitrate"], default=["temperature","salinity"])
+    # ---------------- CMEMS UI (paste INSIDE the `with st.sidebar:` block, after the NetCDF generator controls) ---------------
+    st.markdown("---")
+    st.markdown("## Copernicus (CMEMS) fetch (optional)")
+    enable_cmems = st.checkbox("Enable CMEMS fetch", value=False)
+    if enable_cmems:
+        cmems_user = st.text_input("CMEMS username", value="", help="Your Copernicus Marine Service username")
+        cmems_pwd = st.text_input("CMEMS password", value="", type="password")
+        cmems_vars = st.multiselect("Variables to fetch", options=["thetao", "so", "uo", "vo", "zos"], default=["thetao", "so"], help="thetao = temperature, so = salinity")
+        cmems_date_min = st.date_input("CMEMS start date", value=date.today())
+        cmems_date_max = st.date_input("CMEMS end date", value=date.today())
+        st.markdown("Tip: choose a small bbox and short time-range for quick responses.")
+    # ---------------- end sidebar UI ----------------
+
+# ---------------- CMEMS action block (paste in main app, right after the sidebar block ends) ----------------
+if 'enable_cmems' in locals() and enable_cmems:
+    left_col, right_col = st.columns([2, 1])
+    with left_col:
+        st.markdown("### CMEMS fetch & visualisation")
+        st.write("CMEMS variables:", ", ".join(cmems_vars))
+        # determine bbox fallback: prefer explicit UI bbox if enabled, otherwise fallback to the app bbox defaults
+        if bbox_enable:
+            cm_bbox = {"lonmin": float(lon_min), "lonmax": float(lon_max), "latmin": float(lat_min), "latmax": float(lat_max)}
+        else:
+            # fallback: small Sri Lanka area (example) — user can change via sidebar bbox_enable
+            cm_bbox = {"lonmin": 79.0, "lonmax": 82.0, "latmin": 5.0, "latmax": 10.0}
+
+        if st.button("Fetch CMEMS data now"):
+            # validate credentials
+            if not cmems_user or not cmems_pwd:
+                st.error("Please supply your CMEMS username and password in the sidebar.")
+            else:
+                # assemble date strings for motuclient (use full timestamp format)
+                sd = f"{cmems_date_min.isoformat()} 00:00:00"
+                ed = f"{cmems_date_max.isoformat()} 23:59:59"
+                try:
+                    with st.spinner("Requesting CMEMS subset (may take a few seconds)..."):
+                        ds = fetch_cmems_via_motu(username=cmems_user, password=cmems_pwd, bbox=cm_bbox,
+                                                  start_date=sd, end_date=ed, variables=cmems_vars)
+                    st.success("CMEMS subset downloaded and loaded.")
+                    # show dataset info
+                    st.write(ds)
+                    # standardize var names mapping: many CMEMS products use 'thetao' and 'so'
+                    for var in cmems_vars:
+                        try:
+                            fig_map = plot_variable_map_from_ds(ds, var=var, time_index=0, depth_index=0)
+                            if fig_map is not None:
+                                st.plotly_chart(fig_map, use_container_width=True)
+                        except Exception as e:
+                            st.warning(f"Failed to plot {var}: {e}")
+                    # interactive profile/time series for a chosen point (nearest gridpoint)
+                    try:
+                        lon_choice = float((cm_bbox["lonmin"] + cm_bbox["lonmax"]) / 2.0)
+                        lat_choice = float((cm_bbox["latmin"] + cm_bbox["latmax"]) / 2.0)
+                        st.markdown("#### Timeseries & profile at bbox center")
+                        for var in cmems_vars:
+                            try:
+                                fig_ts = plot_variable_timeseries_at_point(ds, var=var, lon_val=lon_choice, lat_val=lat_choice, depth_index=0)
+                                if fig_ts is not None:
+                                    st.plotly_chart(fig_ts, use_container_width=True)
+                                fig_prof = plot_variable_profile_at_point(ds, var=var, lon_val=lon_choice, lat_val=lat_choice, time_index=0)
+                                if fig_prof is not None:
+                                    st.plotly_chart(fig_prof, use_container_width=True)
+                            except Exception as e:
+                                st.info(f"Could not generate profile/timeseries for {var}: {e}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    st.error(f"CMEMS fetch failed: {e}")
+# ---------------- end CMEMS action block ----------------
 
 
     
