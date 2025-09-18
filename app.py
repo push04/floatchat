@@ -408,7 +408,7 @@ def fetch_cmems_via_motu(username: str, password: str, bbox: dict, start_date: s
 
     # Build motuclient command (CLI). Using --user/--pwd for auth.
     cmd = [
-        sys.executable, "-m", "motuclient",
+        sys.executable, "motuclient",
         "--motu", motu_base,
         "--service-id", service_id,
         "--product-id", product_id,
