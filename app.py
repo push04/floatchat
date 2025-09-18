@@ -473,9 +473,9 @@ def fetch_cmems_via_motu(username: str, password: str, bbox: dict, start_date: s
 def safe_rerun():
     """
     Robust replacement for st.experimental_rerun().
-    Tries public API first, then the internal RerunException, otherwise sets
-    a session flag to force a re-render and asks user to refresh.
-    (No use of deprecated st.experimental_set_query_params.)
+
+    Tries public API first, then the internal RerunException, otherwise flips
+    a session_state key to force a UI change and warns the user to refresh.
     """
     try:
         st.experimental_rerun()
@@ -493,9 +493,9 @@ def safe_rerun():
             st.session_state["_force_rerun_ts"] = time.time()
         except Exception:
             pass
+
         # Inform the user to refresh if everything else fails
         st.warning("Action completed. If the UI didn't update, please refresh your browser.")
-
 
 
 
@@ -872,7 +872,7 @@ if 'enable_cmems' in locals() and enable_cmems:
 # -----------------------------
 # Helper functions
 # -----------------------------
-@cache_data(ttl=60 * 30)
+
 @cache_data(ttl=60 * 30)
 def fetch_obis_records(species_name: str, size: int = 100, bbox: Optional[dict] = None):
     """ Fetch OBIS records and try to capture measurement/eMoF rows when present.
