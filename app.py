@@ -86,7 +86,10 @@ def save_obis_df(df: pd.DataFrame):
     st.session_state["obis_df_records"] = records
     st.session_state["obis_df_columns"] = list(df.columns)
 
-def load_obis_df() -> pd.DataFrame | None:
+from typing import Optional
+
+def load_obis_df() -> Optional[pd.DataFrame]:
+
     """Reconstruct DataFrame from session_state. Return None if not present."""
     recs = st.session_state.get("obis_df_records")
     cols = st.session_state.get("obis_df_columns")
@@ -276,16 +279,12 @@ def _make_dl_key(base: str, filename: str) -> str:
     return safe
 
 def _auto_download_pdf_bytes(pdf_bytes: bytes, filename: str):
-    """
-    Auto-trigger browser download of PDF bytes by creating a base64 data URL
-    and auto-clicking an invisible anchor via a small JS snippet.
-    """
+    """Auto-trigger browser download of PDF bytes using a small JS snippet."""
     try:
         if not isinstance(pdf_bytes, (bytes, bytearray)):
-            # try to coerce
             pdf_bytes = pdf_bytes.getvalue()
         b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-        # create a minimal HTML snippet that auto-clicks a download link
+        # small HTML/JS that auto-clicks a hidden link
         html = f"""
         <html>
           <body>
@@ -293,8 +292,9 @@ def _auto_download_pdf_bytes(pdf_bytes: bytes, filename: str):
             <script>
               const a = document.getElementById('dl');
               if (a) {{
-                // click after a short timeout to let Streamlit render
-                setTimeout(() => a.click(), 50);
+                a.click();
+              }} else {{
+                console.log('download link not found');
               }}
             </script>
           </body>
@@ -305,6 +305,7 @@ def _auto_download_pdf_bytes(pdf_bytes: bytes, filename: str):
     except Exception as e:
         print("[WARN] auto-download failed:", e)
         return False
+
 
 def _style_plotly_light(fig):
     """
@@ -381,9 +382,10 @@ def generate_ocean_netcdf(outfile_path,
         for d_idx, d in enumerate(depths):
             depth_decay = np.exp(-d / 50.0)  # shallower warmer
             # add spatial gradients
-            lon_grad = (lons[np.newaxis, :] - lon_min) / (lon_max - lon_min)
-            lat_grad = (lats[:, np.newaxis] - lat_min) / (lat_max - lat_min)
-            grid = (lat_grad[:,:,None] * lon_grad[None,None,:]).astype(np.float32)
+            lon_grad = (lons[np.newaxis, :] - lon_min) / (lon_max - lon_min)  # shape (1, nx)
+            lat_grad = (lats[:, np.newaxis] - lat_min) / (lat_max - lat_min)  # shape (ny, 1)
+            grid = (lat_grad * lon_grad).astype(np.float32)  # broadcasts to (ny, nx)
+
             temp[t_idx, d_idx, :, :] = base_temp + seasonal + 8.0 * depth_decay + 0.5 * grid
             salt[t_idx, d_idx, :, :] = 35.0 + 0.01 * d + 0.2 * grid  # simple salinity structure
 
@@ -542,22 +544,18 @@ with st.sidebar:
 # Helper functions
 # -----------------------------
 @cache_data(ttl=60 * 30)
+@cache_data(ttl=60 * 30)
 def fetch_obis_records(species_name: str, size: int = 100, bbox: Optional[dict] = None):
-
+    """ Fetch OBIS records and try to capture measurement/eMoF rows when present.
+        Returns a DataFrame with occurrence rows; if measurements present, they will be
+        flattened into repeated rows (one per measurement) in additional columns.
     """
-    Fetch OBIS records. Convert bbox into a stable tuple (hashable) so Streamlit's cache can
-    safely include the bbox in the cache key.
-    """
-    # Turn bbox dict into a hashable tuple (lonmin, lonmax, latmin, latmax) if provided
+    # Build bbox tuple (same as before)
     bbox_tuple = None
     if isinstance(bbox, dict):
         try:
-            bbox_tuple = (
-                float(bbox.get("lonmin")),
-                float(bbox.get("lonmax")),
-                float(bbox.get("latmin")),
-                float(bbox.get("latmax")),
-            )
+            bbox_tuple = (float(bbox.get("lonmin")), float(bbox.get("lonmax")),
+                          float(bbox.get("latmin")), float(bbox.get("latmax")))
         except Exception:
             bbox_tuple = None
     elif isinstance(bbox, (list, tuple)) and len(bbox) == 4:
@@ -566,14 +564,92 @@ def fetch_obis_records(species_name: str, size: int = 100, bbox: Optional[dict] 
     params = {"scientificname": species_name, "size": size}
     if bbox_tuple:
         lonmin, lonmax, latmin, latmax = bbox_tuple
+        # OBIS accepts WKT polygon for geometry
         poly = f"POLYGON(({lonmin} {latmin}, {lonmax} {latmin}, {lonmax} {latmax}, {lonmin} {latmax}, {lonmin} {latmin}))"
         params["geometry"] = poly
 
     r = requests.get(OBIS_API_URL, params=params, timeout=40)
     r.raise_for_status()
     js = r.json()
-    results = js.get("results", [])
-    return pd.DataFrame(results)
+    results = js.get("results", []) or []
+
+    # If results are empty, return empty DataFrame
+    if not results:
+        return pd.DataFrame()
+
+    # Flatten occurrences to DataFrame first
+    occ_df = pd.DataFrame(results)
+
+    # Look for possible measurement/eMoF fields — could be in an 'extendedMeasurements' / 'measurements'
+    # or maybe nested under a key like 'extendedMeasurementOrFact' depending on dataset.
+    # We'll defensively detect common names and, if present, expand into a measurements DataFrame and join.
+    measurement_rows = []
+    for rec in results:
+        occ_id = rec.get("occurrenceID") or rec.get("id") or rec.get("occurrence_id")
+        # try common nested keys
+        nested = rec.get("extendedMeasurementOrFact") or rec.get("measurements") or rec.get("measurement")
+        if nested and isinstance(nested, list):
+            for m in nested:
+                m_rec = {
+                    "occurrenceID": occ_id,
+                    "measurementType": m.get("measurementType") or m.get("measurement_type"),
+                    "measurementValue": m.get("measurementValue") or m.get("measurement_value") or m.get("measurement"),
+                    "measurementUnit": m.get("measurementUnit") or m.get("measurement_unit"),
+                }
+                measurement_rows.append(m_rec)
+
+    if measurement_rows:
+        meas_df = pd.DataFrame(measurement_rows)
+        # Pivot common measurement types into columns (temperature, salinity, etc.)
+        # Normalize measurementType text for matching common names
+        def _norm(s):
+            return (s or "").strip().lower()
+        meas_df["mtype_norm"] = meas_df["measurementType"].apply(_norm)
+
+        # pick common measurement types (add more as needed)
+        rename_map = {}
+        for key in ["temperature", "sea temperature", "sea_surface_temperature", "salinity", "sst", "ssalinity"]:
+            # unify a few variants to simple column names
+            norm = key.replace(" ", "_")
+            rename_map[key] = norm
+
+        # pivot: for each occurrenceID, keep first measurementValue for types we care about
+        pivot = {}
+        for idx, row in meas_df.iterrows():
+            occ = row["occurrenceID"]
+            mt = row["mtype_norm"]
+            val = row["measurementValue"]
+            if occ is None or mt is None or val is None:
+                continue
+            # naive mapping: if measurement type contains 'temp' -> 'temperature', 'salin' -> 'salinity'
+            if "temp" in mt:
+                pivot.setdefault(occ, {})["temperature"] = val
+            elif "salin" in mt:
+                pivot.setdefault(occ, {})["salinity"] = val
+            else:
+                # store other types with the raw name (optional)
+                pivot.setdefault(occ, {})[mt] = val
+
+        # convert pivot to DataFrame and merge back to occ_df on occurrenceID
+        pivot_rows = []
+        for occ, d in pivot.items():
+            r = {"occurrenceID": occ}
+            r.update(d)
+            pivot_rows.append(r)
+        if pivot_rows:
+            pivot_df = pd.DataFrame(pivot_rows)
+            # ensure occ_df has a matching occurrenceID column; try common names
+            if "occurrenceID" not in occ_df.columns:
+                # try to find a unique id column
+                if "id" in occ_df.columns:
+                    occ_df = occ_df.rename(columns={"id": "occurrenceID"})
+                elif "occurrence_id" in occ_df.columns:
+                    occ_df = occ_df.rename(columns={"occurrence_id": "occurrenceID"})
+            # merge (left)
+            occ_df = occ_df.merge(pivot_df, on="occurrenceID", how="left")
+
+    return occ_df
+
 
 
 
@@ -1239,504 +1315,425 @@ if df_prev is not None and not df_prev.empty:
 
 
 
+# --- START: enhanced handler (drop this block in place of your old `if submit and user_input.strip():`) ---
 if submit and user_input.strip():
+    # local imports to be defensive (harmless if already imported)
+    import json
+    import re
+    import requests
+    import pandas as pd
+    from datetime import datetime
+
+    # call LLM and normalize response
     with st.spinner("Routing your input via the LLM..."):
         decision = interpret_input_via_ai(user_input)
 
-    if decision.get("action") == "search" and decision.get("species"):
-        chosen_species = decision["species"]
-        left_col.markdown(f"###  Searching OBIS for species: **{chosen_species}**")
-        loader = left_col.empty()
-        loader.markdown("<div class='muted'><span class='pulse'></span> Fetching records…</div>", unsafe_allow_html=True)
+    # if LLM returned JSON text, parse it
+    if isinstance(decision, str):
         try:
-            bbox = None
-            if bbox_enable:
-                bbox = {"lonmin": lon_min, "lonmax": lon_max, "latmin": lat_min, "latmax": lat_max}
+            decision = json.loads(decision)
+        except Exception:
+            # leave it as-is (will be handled below)
+            pass
 
-            df = fetch_obis_records(chosen_species, size=max_records, bbox=bbox)
-        
-        
-        
-        # --- START: OBIS measurement (eMoF) extraction & quick plots ---
-        # We fetch the raw OBIS JSON for the same query so we can inspect measurement/extendedMeasurement fields.
-        try:
-            # rebuild params similar to fetch_obis_records
-            params = {"scientificname": chosen_species, "size": max_records}
-            if bbox:
-                lonmin, lonmax, latmin, latmax = float(bbox["lonmin"]), float(bbox["lonmax"]), float(bbox["latmin"]), float(bbox["latmax"])
-                poly = f"POLYGON(({lonmin} {latmin}, {lonmax} {latmin}, {lonmax} {latmax}, {lonmin} {latmax}, {lonmin} {latmin}))"
-                params["geometry"] = poly
-            r_meas = requests.get(OBIS_API_URL, params=params, timeout=40)
-            r_meas.raise_for_status()
-            response_json = r_meas.json()
-        except Exception as e:
-            # If the extra JSON fetch fails, keep going with the already-fetched df and warn the user.
-            response_json = {"results": []}
-            left_col.warning(f"Could not fetch raw OBIS JSON for measurements: {e}")
-        
-        # Build a measurements table by scanning common keys used in OBIS occurrence objects
-        meas_rows = []
-        for rec in response_json.get("results", []):
-            occ_id = rec.get("occurrenceID") or rec.get("id") or rec.get("occurrence_id") or None
-            lon = rec.get("decimalLongitude") or rec.get("longitude") or None
-            lat = rec.get("decimalLatitude") or rec.get("latitude") or None
-            event_date = rec.get("eventDate") or rec.get("year") or None
-        
-            # keys that often contain measurement/eMoF info
-            for k in ("measurement", "measurements", "measurementOrFact", "extendedMeasurementOrFact", "emof", "extensions", "environment", "oceano"):
-                if k in rec and rec[k]:
-                    entries = rec[k] if isinstance(rec[k], list) else [rec[k]]
-                    for m in entries:
-                        # measurement shapes vary: be permissive
-                        mtype = (m.get("measurementType") or m.get("measurementTypeID") or m.get("type")
-                                 or m.get("measurementTypeLabel") or m.get("name") or "")
-                        mval = m.get("measurementValue") or m.get("value") or m.get("measurement_value") or None
-                        munit = (m.get("measurementUnit") or m.get("measurementUnitID") or m.get("unit")
-                                 or m.get("measurementUnitLabel") or "")
-                        # if a nested dict or string contains numbers, try to extract numeric
-                        if isinstance(mval, str):
-                            try:
-                                first_num = re.findall(r"[-+]?\d*\.\d+|\d+", mval)
-                                if first_num:
-                                    mval = float(first_num[0])
-                            except Exception:
-                                pass
-                        meas_rows.append({
-                            "occurrenceID": occ_id,
-                            "lon": lon,
-                            "lat": lat,
-                            "time": event_date,
-                            "measurementType": str(mtype),
-                            "value": mval,
-                            "unit": str(munit)
-                        })
-        
-        # Also look under extensions (some OBIS datasets put eMoF under rec['extensions'][<name>])
-        if not meas_rows:
-            for rec in response_json.get("results", []):
-                exts = rec.get("extensions") or {}
-                for ext_name, ext_rows in exts.items():
-                    if isinstance(ext_rows, list):
-                        for m in ext_rows:
-                            mtype = m.get("measurementType") or m.get("measurement_type") or m.get("type") or ""
+    # ensure decision is a dict before using .get
+    if not isinstance(decision, dict):
+        st.warning("AI returned an unexpected response (not a JSON object). Try rephrasing or try again.")
+    else:
+        # --- If AI asks to search OBIS for a species ---
+        if decision.get("action") == "search" and decision.get("species"):
+            chosen_species = decision["species"]
+            left_col.markdown(f"### Searching OBIS for species: **{chosen_species}**")
+
+            loader = left_col.empty()
+            loader.markdown("<div class='muted'><span class='pulse'></span> Fetching records…</div>", unsafe_allow_html=True)
+
+            try:
+                # prepare bbox if enabled (defensive casting)
+                bbox = None
+                if bbox_enable:
+                    try:
+                        bbox = {
+                            "lonmin": float(lon_min),
+                            "lonmax": float(lon_max),
+                            "latmin": float(lat_min),
+                            "latmax": float(lat_max),
+                        }
+                    except Exception:
+                        bbox = None
+
+                # fetch occurrences via your helper (may return DataFrame or None)
+                df = fetch_obis_records(chosen_species, size=max_records, bbox=bbox)
+
+                # coerce to DataFrame if needed
+                if df is None:
+                    df = pd.DataFrame()
+                elif not isinstance(df, pd.DataFrame):
+                    try:
+                        df = pd.DataFrame(df)
+                    except Exception:
+                        df = pd.DataFrame()
+
+                # --- Extra: fetch raw OBIS JSON to look for eMoF / extended measurements ---
+                response_json = {"results": []}
+                try:
+                    params = {"scientificname": chosen_species, "size": int(max_records)}
+                    if bbox:
+                        lonmin, lonmax = float(bbox["lonmin"]), float(bbox["lonmax"])
+                        latmin, latmax = float(bbox["latmin"]), float(bbox["latmax"])
+                        poly = f"POLYGON(({lonmin} {latmin}, {lonmax} {latmin}, {lonmax} {latmax}, {lonmin} {latmax}, {lonmin} {latmin}))"
+                        params["geometry"] = poly
+                    r_meas = requests.get(OBIS_API_URL, params=params, timeout=40)
+                    r_meas.raise_for_status()
+                    response_json = r_meas.json() or {"results": []}
+                except Exception as e:
+                    # proceed but warn user
+                    left_col.warning(f"Could not fetch raw OBIS JSON for measurements: {e}")
+
+                # build measurement rows defensively
+                meas_rows = []
+                for rec in response_json.get("results", []):
+                    occ_id = rec.get("occurrenceID") or rec.get("id") or rec.get("occurrence_id") or None
+                    lon = rec.get("decimalLongitude") or rec.get("longitude") or None
+                    lat = rec.get("decimalLatitude") or rec.get("latitude") or None
+                    event_date = rec.get("eventDate") or rec.get("year") or None
+
+                    # candidate keys where measurements/eMoF can live
+                    candidates = []
+                    for k in ("extendedMeasurementOrFact", "extendedmeasurementorfact", "measurements", "measurement", "measurementOrFact", "emof", "extensions"):
+                        if k in rec and rec[k]:
+                            candidates.append((k, rec[k]))
+
+                    # also inspect extensions mapping (some providers store eMoF under extensions)
+                    exts = rec.get("extensions") or {}
+                    if isinstance(exts, dict):
+                        for ext_name, ext_rows in exts.items():
+                            if ext_rows:
+                                candidates.append((f"extensions.{ext_name}", ext_rows))
+
+                    for keyname, entries in candidates:
+                        entries_list = entries if isinstance(entries, list) else [entries]
+                        for m in entries_list:
+                            if not isinstance(m, dict):
+                                continue
+                            mtype = (m.get("measurementType") or m.get("measurementTypeID") or m.get("type")
+                                     or m.get("name") or m.get("measurement_type") or "")
                             mval = m.get("measurementValue") or m.get("measurement_value") or m.get("value") or None
-                            munit = m.get("measurementUnit") or m.get("measurement_unit") or ""
-                            try:
-                                if isinstance(mval, str):
-                                    first_num = re.findall(r"[-+]?\d*\.\d+|\d+", mval)
-                                    if first_num:
-                                        mval = float(first_num[0])
-                            except Exception:
-                                pass
+                            munit = (m.get("measurementUnit") or m.get("measurement_unit") or m.get("unit") or "")
+                            # try to coerce string numbers to float
+                            if isinstance(mval, str):
+                                try:
+                                    found = re.findall(r"[-+]?\d*\.\d+|\d+", mval)
+                                    if found:
+                                        mval = float(found[0])
+                                except Exception:
+                                    pass
                             meas_rows.append({
-                                "occurrenceID": rec.get("occurrenceID"),
-                                "lon": rec.get("decimalLongitude"),
-                                "lat": rec.get("decimalLatitude"),
-                                "time": rec.get("eventDate"),
+                                "occurrenceID": occ_id,
+                                "lon": lon,
+                                "lat": lat,
+                                "time": event_date,
                                 "measurementType": str(mtype),
                                 "value": mval,
                                 "unit": str(munit)
                             })
-        
-        import pandas as _pd  # local alias to avoid shadowing if 'pd' is used elsewhere
-        df_meas = _pd.DataFrame(meas_rows)
-        
-        if df_meas.empty:
-            left_col.info("No eMoF/measurement rows found in the returned OBIS occurrences for this query. Try a wider bbox or use the OBIS Mapper export with measurements included.")
-        else:
-            # Normalize measurement type text for simple matching
-            df_meas["mtype_norm"] = df_meas["measurementType"].astype(str).str.lower().fillna("")
-            # heuristics to find temp / salinity
-            temp_mask = df_meas["mtype_norm"].str.contains("temp") | df_meas["unit"].astype(str).str.contains("c|°c", case=False, na=False)
-            sal_mask = df_meas["mtype_norm"].str.contains("salin") | df_meas["unit"].astype(str).str.contains("psu|ppt", case=False, na=False)
-        
-            df_temp = df_meas[temp_mask].dropna(subset=["value"]).copy()
-            df_sal = df_meas[sal_mask].dropna(subset=["value"]).copy()
-        
-            if not df_temp.empty:
-                left_col.markdown("### Temperature measurements (sample from OBIS eMoF)")
-                left_col.dataframe(df_temp.head(200))
-                # map of temperature points
-                fig_t = px.scatter_mapbox(df_temp, lon="lon", lat="lat", color="value",
-                                          hover_data=["occurrenceID", "time", "unit", "measurementType"],
-                                          title="OBIS: temperature measurements", height=450)
-                fig_t.update_layout(mapbox_style="open-street-map")
-                _style_plotly_light(fig_t)
-                left_col.plotly_chart(fig_t, use_container_width=True)
-                # histogram
-                left_col.plotly_chart(px.histogram(df_temp, x="value", nbins=40, title="Temperature distribution (OBIS)"), use_container_width=True)
-        
-            if not df_sal.empty:
-                left_col.markdown("### Salinity measurements (sample from OBIS eMoF)")
-                left_col.dataframe(df_sal.head(200))
-                fig_s = px.scatter_mapbox(df_sal, lon="lon", lat="lat", color="value",
-                                          hover_data=["occurrenceID", "time", "unit", "measurementType"],
-                                          title="OBIS: salinity measurements", height=450)
-                fig_s.update_layout(mapbox_style="open-street-map")
-                _style_plotly_light(fig_s)
-                left_col.plotly_chart(fig_s, use_container_width=True)
-                left_col.plotly_chart(px.histogram(df_sal, x="value", nbins=40, title="Salinity distribution (OBIS)"), use_container_width=True)
-        # --- END measurement extraction & plotting ---
-        
-        except Exception as e:
-            # Close the outer try: which wrapped the fetch + measurement parsing.
-            # Warn the user and ensure variables used later exist so downstream code doesn't crash.
-            try:
-                left_col.warning(f"OBIS fetch/measurement processing failed: {e}")
-            except Exception:
-                # left_col may not be defined in some execution paths; ignore if so.
-                pass
-            # make sure df and response_json exist for later code
-            try:
-                import pandas as pd
-                df = pd.DataFrame()
-            except Exception:
-                df = []
-            response_json = {"results": []}
-            meas_rows = []
 
-            
+                df_meas = pd.DataFrame(meas_rows)
 
+                # show measurement-derived plots if any
+                if not df_meas.empty:
+                    try:
+                        import plotly.express as px
+                        df_meas["mtype_norm"] = df_meas["measurementType"].fillna("").astype(str).str.lower()
+                        df_meas["unit_norm"] = df_meas["unit"].fillna("").astype(str).str.lower()
 
+                        temp_mask = df_meas["mtype_norm"].str.contains("temp", na=False) | df_meas["unit_norm"].str.contains("c|°c", na=False)
+                        sal_mask = df_meas["mtype_norm"].str.contains("salin", na=False) | df_meas["unit_norm"].str.contains("psu|ppt", na=False)
 
+                        df_temp = df_meas[temp_mask & df_meas["value"].notna()].copy()
+                        df_sal = df_meas[sal_mask & df_meas["value"].notna()].copy()
 
-            
+                        if not df_temp.empty:
+                            left_col.markdown("### Temperature measurements (sample from OBIS eMoF)")
+                            left_col.dataframe(df_temp.head(200))
+                            fig_t = px.scatter_mapbox(
+                                df_temp, lon="lon", lat="lat", color="value",
+                                hover_data=["occurrenceID", "time", "unit", "measurementType"],
+                                title="OBIS: temperature measurements", height=450
+                            )
+                            fig_t.update_layout(mapbox_style="open-street-map")
+                            try:
+                                _style_plotly_light(fig_t)
+                            except Exception:
+                                pass
+                            left_col.plotly_chart(fig_t, use_container_width=True)
+                            left_col.plotly_chart(px.histogram(df_temp, x="value", nbins=40, title="Temperature distribution (OBIS)"), use_container_width=True)
 
-            
-            # parse and filter by date range (if eventDate is present)
-            if not df.empty and "eventDate" in df.columns:
+                        if not df_sal.empty:
+                            left_col.markdown("### Salinity measurements (sample from OBIS eMoF)")
+                            left_col.dataframe(df_sal.head(200))
+                            fig_s = px.scatter_mapbox(
+                                df_sal, lon="lon", lat="lat", color="value",
+                                hover_data=["occurrenceID", "time", "unit", "measurementType"],
+                                title="OBIS: salinity measurements", height=450
+                            )
+                            fig_s.update_layout(mapbox_style="open-street-map")
+                            try:
+                                _style_plotly_light(fig_s)
+                            except Exception:
+                                pass
+                            left_col.plotly_chart(fig_s, use_container_width=True)
+                            left_col.plotly_chart(px.histogram(df_sal, x="value", nbins=40, title="Salinity distribution (OBIS)"), use_container_width=True)
+                    except Exception:
+                        # plotting is optional — if plotly not installed or fails, show measurements table
+                        left_col.info("Measurement rows were found but plotting failed. Showing table preview.")
+                        left_col.dataframe(df_meas.head(200))
+                else:
+                    left_col.info("No eMoF/measurement rows found in the returned OBIS occurrences for this query.")
+
+                # --- filter by date range if available (defensive) ---
                 try:
-                    df["eventDate"] = pd.to_datetime(df["eventDate"], errors="coerce")
-                    if start_date:
-                        df = df[df["eventDate"] >= pd.to_datetime(start_date)]
-                    if end_date:
-                        df = df[df["eventDate"] <= pd.to_datetime(end_date)]
+                    if not df.empty and "eventDate" in df.columns:
+                        df["eventDate"] = pd.to_datetime(df["eventDate"], errors="coerce")
+                        if start_date:
+                            df = df[df["eventDate"] >= pd.to_datetime(start_date)]
+                        if end_date:
+                            df = df[df["eventDate"] <= pd.to_datetime(end_date)]
                 except Exception:
+                    # non-fatal; continue with unfiltered data
                     pass
 
-            loader.empty()
-            if df.empty:
-                left_col.warning(f"No records found for species: {chosen_species} (after date/filters)")
-            else:
-                keep_cols = [c for c in ["scientificName","eventDate","decimalLongitude","decimalLatitude","depth","basisOfRecord","institutionCode"] if c in df.columns]
-                df_clean = df[keep_cols].copy()
-                if "eventDate" in df_clean.columns:
-                    try:
-                        df_clean["eventDate"] = pd.to_datetime(df_clean["eventDate"], errors="coerce")
-                    except Exception:
-                        pass
+                loader.empty()
 
-                # store in session for AI use and persistent display (store as plain records+cols)
-                save_obis_df(df_clean)
-                st.session_state["last_species"] = chosen_species  # save species for cached UI / downloads
-
-
-                left_col.success(f"Found {len(df_clean)} records for '{chosen_species}'")
-                # summary stats
-                c1, c2, c3 = left_col.columns([1,1,2])
-                with c1:
-                    left_col.markdown(f"<div class='stat'><strong>{len(df_clean)}</strong><div class='small muted'>records</div></div>", unsafe_allow_html=True)
-                with c2:
-                    unique_locs = df_clean.dropna(subset=["decimalLongitude","decimalLatitude"]).shape[0]
-                    left_col.markdown(f"<div class='stat'><strong>{unique_locs}</strong><div class='small muted'>geo points</div></div>", unsafe_allow_html=True)
-                with c3:
-                    range_time = "-"
-                    if "eventDate" in df_clean.columns and df_clean["eventDate"].notna().any():
-                        mn = df_clean["eventDate"].min(); mx = df_clean["eventDate"].max()
-                        range_time = f"{mn.date()} → {mx.date()}"
-                    left_col.markdown(f"<div class='small muted'>Date range: {range_time}</div>", unsafe_allow_html=True)
-
-                # map + plots
-                figs = make_plots_from_df(df_clean, chosen_species)
-                if "map" in figs:
-                    left_col.plotly_chart(figs["map"], use_container_width=True)
-                # show other figs in two rows
-                if "yearly" in figs or "monthly" in figs:
-                    row1 = left_col.columns(2)
-                    if "yearly" in figs:
-                        row1[0].plotly_chart(figs["yearly"], use_container_width=True)
-                    if "monthly" in figs:
-                        row1[1].plotly_chart(figs["monthly"], use_container_width=True)
-                if "depth_hist" in figs or "density" in figs:
-                    row2 = left_col.columns(2)
-                    if "depth_hist" in figs:
-                        row2[0].plotly_chart(figs["depth_hist"], use_container_width=True)
-                    if "density" in figs:
-                        row2[1].plotly_chart(figs["density"], use_container_width=True)
-
-                left_col.markdown("#### Sample records")
-                left_col.dataframe(df_clean.head(200))
-
-                # download CSV & Excel (for fetched results)
-                try:
-                    csv_str = prepare_csv_download(df_clean)
-                    xlsx_bytes = prepare_excel_download(df_clean)
-                    species_key = chosen_species.replace(" ", "_").replace("/", "_")
-                    dl_button(left_col, "Download fetched records (CSV)",
-                              data=csv_str, file_name=f"{species_key}_obis.csv", mime="text/csv", base=f"fetched_{species_key}")
-                    dl_button(left_col, "Download fetched records (Excel)",
-                              data=xlsx_bytes, file_name=f"{species_key}_obis.xlsx",
-                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", base=f"fetched_{species_key}")
-                except Exception:
-                    # fallback: CSV only
-                    csv_str = prepare_csv_download(df_clean)
-                    species_key = chosen_species.replace(" ", "_").replace("/", "_")
-                    dl_button(left_col, "Download fetched records (CSV)",
-                              data=csv_str, file_name=f"{species_key}_obis.csv", mime="text/csv", base=f"fetched_{species_key}_fallback")
-                    
-
-
-                # Auto-summary if enabled — keep summary in session so it persists across reruns
-                if auto_summary:
-                    right_col.markdown("###  AI Summary (auto)")
-                    loading_slot = right_col.empty()
-                    loading_slot.markdown("<div class='muted'><span class='pulse'></span> AI summarizing the fetched records...</div>", unsafe_allow_html=True)
-                    try:
-                        summary = ai_summarize_records(df_clean, chosen_species)
-                        # persist summary so it doesn't vanish on rerun
-                        st.session_state["last_summary"] = summary
-                        right_col.markdown(summary)
-                        # auto-generate PDF and trigger download (non-blocking for UI)
+                # handle empty dataset
+                if df.empty:
+                    left_col.warning(f"No records found for species: {chosen_species} (after date/filters).")
+                else:
+                    # select a small set of useful columns for display and caching
+                    keep_cols = [c for c in ["scientificName", "eventDate", "decimalLongitude", "decimalLatitude", "depth", "basisOfRecord", "institutionCode"] if c in df.columns]
+                    df_clean = df[keep_cols].copy() if keep_cols else df.copy()
+                    # coerce eventDate for summary
+                    if "eventDate" in df_clean.columns:
                         try:
-                            # ensure df_for_pdf and figs_local are available similarly to your Generate PDF flow
-                            df_for_pdf = load_obis_df()
-                            if df_for_pdf is not None and not df_for_pdf.empty:
-                                figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species", chosen_species))
-                                pdf_bytes_auto = generate_pdf_report(df_for_pdf, st.session_state.get("last_species", chosen_species), summary, figs_local)
-                                if isinstance(pdf_bytes_auto, (bytes, bytearray)) and len(pdf_bytes_auto) > 0:
-                                    # store for later and auto-download
-                                    fname_auto = f"{(st.session_state.get('last_species') or chosen_species).replace(' ','_')}_auto_report.pdf"
-                                    st.session_state["last_pdf"] = pdf_bytes_auto
-                                    st.session_state["last_pdf_name"] = fname_auto
-                                    _auto_download_pdf_bytes(pdf_bytes_auto, fname_auto)
-                        except Exception as e:
-                            # don't break UI on auto-download failure — keep existing UI
-                            print("[WARN] auto PDF-on-summary failed:", e)
+                            df_clean["eventDate"] = pd.to_datetime(df_clean["eventDate"], errors="coerce")
+                        except Exception:
+                            pass
 
-                    except Exception as e:
-                        right_col.error(f"Auto-summary failed: {e}")
-                    finally:
-                        loading_slot.empty()
-
-
-                # --- DATASET-AWARE AI CHAT (persistent) ---
-                right_col.markdown("###  Ask AI about this dataset")
-                # Dataset-aware question input — use key only so Streamlit stores value in session_state reliably
-                ai_data_query = right_col.text_area(
-                    "Ask a question about the current dataset (the AI will see a small sample and previous summary):",
-                    key="data_ai_input",
-                    height=120
-                )
-
-                # When user clicks, send compact context + question to LLM and store the reply in session_state
-                if right_col.button("Ask AI about data", key="ask_data_ai"):
-                    # Read the latest user question from session (guaranteed to be stable across reruns)
-                    ai_data_query = st.session_state.get("data_ai_input", "").strip()
-                    st.session_state["last_data_ai_query"] = ai_data_query
-
-                    # prepare compact sample (safe size)
-                    sample_for_ai = None
+                    # persist for later UI / AI steps
                     try:
-                        df_for_sample = load_obis_df()
-                        if df_for_sample is not None and not df_for_sample.empty:
-                            sample_for_ai = df_for_sample.head(30).to_dict(orient="records")
-
+                        save_obis_df(df_clean)
                     except Exception:
+                        # best-effort; don't crash if save helper missing
+                        pass
+                    st.session_state["last_species"] = chosen_species
+
+                    left_col.success(f"Found {len(df_clean)} records for '{chosen_species}'")
+
+                    # summary stats
+                    c1, c2, c3 = left_col.columns([1, 1, 2])
+                    with c1:
+                        c1.markdown(f"<div class='stat'><strong>{len(df_clean)}</strong><div class='small muted'>records</div></div>", unsafe_allow_html=True)
+                    with c2:
+                        unique_locs = df_clean.dropna(subset=["decimalLongitude", "decimalLatitude"]).shape[0] if {"decimalLongitude", "decimalLatitude"}.issubset(df_clean.columns) else 0
+                        c2.markdown(f"<div class='stat'><strong>{unique_locs}</strong><div class='small muted'>geo points</div></div>", unsafe_allow_html=True)
+                    with c3:
+                        range_time = "-"
+                        if "eventDate" in df_clean.columns and df_clean["eventDate"].notna().any():
+                            mn = df_clean["eventDate"].min(); mx = df_clean["eventDate"].max()
+                            range_time = f"{mn.date()} → {mx.date()}"
+                        c3.markdown(f"<div class='small muted'>Date range: {range_time}</div>", unsafe_allow_html=True)
+
+                    # plots from helper
+                    try:
+                        figs = make_plots_from_df(df_clean, chosen_species)
+                        if isinstance(figs, dict):
+                            if "map" in figs:
+                                left_col.plotly_chart(figs["map"], use_container_width=True)
+                            # 2-column layout for other figs
+                            pair = left_col.columns(2)
+                            if "yearly" in figs:
+                                pair[0].plotly_chart(figs["yearly"], use_container_width=True)
+                            if "monthly" in figs:
+                                pair[1].plotly_chart(figs["monthly"], use_container_width=True)
+                            pair2 = left_col.columns(2)
+                            if "depth_hist" in figs:
+                                pair2[0].plotly_chart(figs["depth_hist"], use_container_width=True)
+                            if "density" in figs:
+                                pair2[1].plotly_chart(figs["density"], use_container_width=True)
+                    except Exception:
+                        left_col.info("Plot generation failed — showing table preview.")
+                        left_col.dataframe(df_clean.head(200))
+
+                    # sample records display
+                    left_col.markdown("#### Sample records")
+                    left_col.dataframe(df_clean.head(200))
+
+                    # download buttons (CSV + Excel where possible)
+                    try:
+                        csv_str = prepare_csv_download(df_clean)
+                        species_key = chosen_species.replace(" ", "_").replace("/", "_")
+                        dl_button(left_col, "Download fetched records (CSV)", data=csv_str, file_name=f"{species_key}_obis.csv", mime="text/csv", base=f"fetched_{species_key}")
+                        try:
+                            xlsx_bytes = prepare_excel_download(df_clean)
+                            dl_button(left_col, "Download fetched records (Excel)", data=xlsx_bytes, file_name=f"{species_key}_obis.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", base=f"fetched_{species_key}_xlsx")
+                        except Exception:
+                            # Excel optional
+                            pass
+                    except Exception:
+                        left_col.info("Could not prepare downloads for this dataset.")
+
+                    # Optional auto summary
+                    if auto_summary:
+                        right_col.markdown("### AI Summary (auto)")
+                        loading_slot = right_col.empty()
+                        loading_slot.markdown("<div class='muted'><span class='pulse'></span> AI summarizing the fetched records...</div>", unsafe_allow_html=True)
+                        try:
+                            summary = ai_summarize_records(df_clean, chosen_species)
+                            st.session_state["last_summary"] = summary
+                            right_col.markdown(summary)
+                            # attempt to auto-generate PDF bytes (best-effort)
+                            try:
+                                df_for_pdf = load_obis_df()
+                                if df_for_pdf is not None and not df_for_pdf.empty:
+                                    figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species", chosen_species))
+                                    pdf_bytes_auto = generate_pdf_report(df_for_pdf, st.session_state.get("last_species", chosen_species), summary, figs_local)
+                                    if isinstance(pdf_bytes_auto, (bytes, bytearray)) and len(pdf_bytes_auto) > 0:
+                                        fname_auto = f"{(st.session_state.get('last_species') or chosen_species).replace(' ','_')}_auto_report.pdf"
+                                        st.session_state["last_pdf"] = pdf_bytes_auto
+                                        st.session_state["last_pdf_name"] = fname_auto
+                                        # try JS auto-download, don't break UI on failure
+                                        try:
+                                            _auto_download_pdf_bytes(pdf_bytes_auto, fname_auto)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            right_col.error(f"Auto-summary failed: {e}")
+                        finally:
+                            loading_slot.empty()
+
+                    # DATASET-AWARE AI CHAT UI (keeps small sample + summary)
+                    right_col.markdown("### Ask AI about this dataset")
+                    ai_data_query = right_col.text_area(
+                        "Ask a question about the current dataset (the AI will see a small sample and previous summary):",
+                        key="data_ai_input",
+                        height=120
+                    )
+                    if right_col.button("Ask AI about data", key="ask_data_ai"):
+                        ai_data_query = st.session_state.get("data_ai_input", "").strip()
+                        st.session_state["last_data_ai_query"] = ai_data_query
+                        # prepare sample for AI
                         sample_for_ai = None
+                        try:
+                            df_for_sample = load_obis_df()
+                            if df_for_sample is not None and not df_for_sample.empty:
+                                sample_for_ai = df_for_sample.head(30).to_dict(orient="records")
+                        except Exception:
+                            sample_for_ai = None
 
-                    # build messages
-                    system_msg = {
-                        "role": "system",
-                        "content": "You are a helpful marine biology data assistant. Analyze the sample and answer the user's question concisely, suggest one next-step analysis."
-                    }
-                    parts = []
-                    if sample_for_ai:
-                        parts.append(f"Sample records (up to 30 rows): {sample_for_ai}")
-                    if st.session_state.get("last_summary"):
-                        parts.append(f"Existing AI summary: {st.session_state.get('last_summary')}")
-                    parts.append(f"User question: {ai_data_query or '[NO QUESTION]'}")
-                    user_msg = {"role": "user", "content": "\n\n".join(parts)}
+                        system_msg = {
+                            "role": "system",
+                            "content": "You are a helpful marine biology data assistant. Analyze the sample and answer the user's question concisely, suggest one next-step analysis."
+                        }
+                        parts = []
+                        if sample_for_ai:
+                            parts.append(f"Sample records (up to 30 rows): {sample_for_ai}")
+                        if st.session_state.get("last_summary"):
+                            parts.append(f"Existing AI summary: {st.session_state.get('last_summary')}")
+                        parts.append(f"User question: {ai_data_query or '[NO QUESTION]'}")
+                        user_msg = {"role": "user", "content": "\n\n".join(parts)}
 
-                    # show a lightweight loading pulse in the right column while the LLM runs
-                    loading_slot = right_col.empty()
-                    loading_slot.markdown("<div class='muted'><span class='pulse'></span> AI analyzing dataset...</div>", unsafe_allow_html=True)
-                    try:
-                        ai_reply = ask_openrouter([system_msg, user_msg])
-                        # persist short history
-                        entry = {"question": ai_data_query, "answer": ai_reply, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
-                        st.session_state.setdefault("data_ai_history", []).append(entry)
-                        # store latest reply for UI uses and persist as "last_summary" so it doesn't vanish
-                        st.session_state["last_data_ai_reply"] = ai_reply
-                        st.session_state["last_summary"] = ai_reply
-                        # show answer
-                        right_col.markdown("**AI answer:**")
-                        right_col.markdown(ai_reply)
-                    except Exception as e:
-                        right_col.error(f"AI request failed: {e}")
-                    finally:
-                        loading_slot.empty()
+                        loading_slot = right_col.empty()
+                        loading_slot.markdown("<div class='muted'><span class='pulse'></span> AI analyzing dataset...</div>", unsafe_allow_html=True)
+                        try:
+                            ai_reply = ask_openrouter([system_msg, user_msg])
+                            entry = {"question": ai_data_query, "answer": ai_reply, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
+                            st.session_state.setdefault("data_ai_history", []).append(entry)
+                            st.session_state["last_data_ai_reply"] = ai_reply
+                            st.session_state["last_summary"] = ai_reply
+                            right_col.markdown("**AI answer:**")
+                            right_col.markdown(ai_reply)
+                        except Exception as e:
+                            right_col.error(f"AI request failed: {e}")
+                        finally:
+                            loading_slot.empty()
 
+                    # recent Q&A
+                    if st.session_state.get("data_ai_history"):
+                        right_col.markdown("#### Recent dataset queries")
+                        for item in reversed(st.session_state["data_ai_history"][-6:]):
+                            with right_col.expander(f"Q: {item['question'][:60] or '(no question)'} — {item['time']}", expanded=False):
+                                right_col.markdown(f"**Q:** {item['question']}")
+                                right_col.markdown(f"**A:** {item['answer']}")
 
-                # show recent dataset-AI Q&A (most recent first)
-                if st.session_state.get("data_ai_history"):
-                    right_col.markdown("#### Recent dataset queries")
-                    # show up to last 6 queries
-                    for item in reversed(st.session_state["data_ai_history"][-6:]):
-                        with right_col.expander(f"Q: {item['question'][:60] or '(no question)'} — {item['time']}", expanded=False):
-                            right_col.markdown(f"**Q:** {item['question']}")
-                            right_col.markdown(f"**A:** {item['answer']}")
-
-
-                # PDF report generation button
-                                # PDF report generation button
-                right_col.markdown("###  Export")
-                if right_col.button("Generate PDF report (maps + summary)"):
-                    right_col.info("Generating PDF... this may take a few seconds.")
-                    try:
-                        # Reconstruct dataset from session
-                        df_for_pdf = load_obis_df()
-                        if df_for_pdf is None or df_for_pdf.empty:
-                            right_col.error("No cached dataset available for PDF generation. Fetch a species first.")
-                        else:
-                            # prepare figures from the reconstructed df (do not rely on a local 'figs' variable that disappears after rerun)
-                            figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species", ""))
-                            summary_text = st.session_state.get("last_summary", "")
-                            pdf_loading = right_col.empty()
-                            pdf_loading.markdown("<div class='muted'><span class='pulse'></span> Rendering PDF...</div>", unsafe_allow_html=True)
-                            try:
-                                pdf_bytes = generate_pdf_report(df_for_pdf, st.session_state.get("last_species", ""), summary_text, figs_local)
-                                # force bytes
-                                if not isinstance(pdf_bytes, (bytes, bytearray)):
-                                    try:
-                                        pdf_bytes = pdf_bytes.getvalue()
-                                    except Exception as e:
-                                        raise RuntimeError(f"PDF generator returned non-bytes and could not be converted: {e}")
-
-                                # store PDF in session for persistent download
-                                fname = f"{(st.session_state.get('last_species') or 'obis_report').replace(' ','_')}_report.pdf"
-                                # store PDF into session
-                                st.session_state["last_pdf"] = pdf_bytes
-                                st.session_state["last_pdf_name"] = fname
-                                st.session_state["last_pdf_species"] = st.session_state.get("last_species")
-
-                                right_col.success("PDF generated — you can download it below.")
-                                right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
-
-                                # create a normal download button for fallback / manual download
-                                # Try auto-download first (JS). If it fails, show a manual download button as fallback.
+                    # Export / PDF button (single, consolidated flow)
+                    right_col.markdown("### Export")
+                    if right_col.button("Generate PDF report (maps + summary)"):
+                        right_col.info("Generating PDF... this may take a few seconds.")
+                        try:
+                            df_for_pdf = load_obis_df()
+                            if df_for_pdf is None or df_for_pdf.empty:
+                                right_col.error("No cached dataset available for PDF generation. Fetch a species first.")
+                            else:
+                                summary_text = st.session_state.get("last_summary", "")
+                                figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species", ""))
+                                pdf_loading = right_col.empty()
+                                pdf_loading.markdown("<div class='muted'><span class='pulse'></span> Rendering PDF...</div>", unsafe_allow_html=True)
                                 try:
-                                    auto_ok = _auto_download_pdf_bytes(pdf_bytes, fname)
-                                except Exception:
+                                    pdf_bytes = generate_pdf_report(df_for_pdf, st.session_state.get("last_species", ""), summary_text, figs_local)
+                                    if not isinstance(pdf_bytes, (bytes, bytearray)):
+                                        try:
+                                            pdf_bytes = pdf_bytes.getvalue()
+                                        except Exception as e:
+                                            raise RuntimeError(f"PDF generator returned non-bytes and could not be converted: {e}")
+                                    fname = f"{(st.session_state.get('last_species') or 'obis_report').replace(' ','_')}_report.pdf"
+                                    st.session_state["last_pdf"] = pdf_bytes
+                                    st.session_state["last_pdf_name"] = fname
+                                    st.session_state["last_pdf_species"] = st.session_state.get("last_species")
+                                    # try auto-download; fallback to manual
                                     auto_ok = False
-
-                                right_col.success("PDF generated.")
-                                right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
-
-                                # If auto-download didn't work, provide the manual Streamlit download button as fallback
-                                if not auto_ok:
                                     try:
-                                        dl_button(
-                                            right_col,
-                                            "Download PDF report",
-                                            data=pdf_bytes,
-                                            file_name=fname,
-                                            mime="application/pdf",
-                                            base=f"pdf_{fname}",
-                                        )
-                                    except Exception as e:
-                                        right_col.error(f"Could not create download button: {e}")
-                                else:
-                                    # user was auto-sent the file — optionally give a small note and avoid duplicate download buttons
-                                    right_col.markdown("<div class='small muted'>Auto-download attempted — check your browser downloads.</div>", unsafe_allow_html=True)
-
-
-                                # DO NOT clear the cached dataset here. Keep data for subsequent AI questions/downloads.
-                            except Exception as e:
-                                right_col.error(f"PDF creation failed: {e}")
-                                right_col.info("Common cause: missing kaleido or reportlab in the environment. Install them and restart Streamlit.")
-                            finally:
-                                pdf_loading.empty()
-                    except Exception as e:
-                        right_col.error(f"Failed to create PDF: {e}")
-
-
-                        # if AI summary not present, generate one (non-blocking)
-                        summary_text = ""
-                        if auto_summary:
-                            try:
-                                summary_text = ai_summarize_records(df_clean, chosen_species)
-                            except Exception as e:
-                                summary_text = ""
-                                right_col.warning(f"AI summary failed: {e}")
-                        else:
-                            summary_text = "No AI summary requested (toggle auto-summary in sidebar)."
-
-                                                # Attempt PDF creation and surface debug info
-                        # Reconstruct df from session (defensive)
-                        df_for_pdf = load_obis_df()
-                        if df_for_pdf is None:
-                            right_col.error("Dataset not available for PDF generation.")
-                        else:
-                            pdf_loading = right_col.empty()
-                            pdf_loading.markdown("<div class='muted'><span class='pulse'></span> Rendering PDF...</div>", unsafe_allow_html=True)
-                            try:
-                                figs_local = make_plots_from_df(df_for_pdf, chosen_species)
-                                pdf_bytes = generate_pdf_report(df_for_pdf, chosen_species, summary_text, figs_local)
-
-                                # coerce to bytes if necessary
-                                if not isinstance(pdf_bytes, (bytes, bytearray)):
-                                    try:
-                                        pdf_bytes = pdf_bytes.getvalue()
-                                    except Exception as e:
-                                        raise RuntimeError(f"PDF generator returned non-bytes and could not be converted: {e}")
-
-                                # store PDF in session for persistent download
-                                fname = f"{chosen_species.replace(' ','_')}_report.pdf"
-                                st.session_state["last_pdf"] = pdf_bytes
-                                st.session_state["last_pdf_name"] = fname
-                                st.session_state["last_pdf_species"] = chosen_species
-
-                                right_col.success("PDF generated — you can download it below.")
-                                right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
-
-                                # immediate download button in right column (unique key)
-                                try:
-                                    dl_button(right_col, "Download PDF report (immediate)", data=pdf_bytes, file_name=fname,
-                                              mime="application/pdf", base=f"pdf_{chosen_species.replace(' ','_')}")
+                                        auto_ok = bool(_auto_download_pdf_bytes(pdf_bytes, fname))
+                                    except Exception:
+                                        auto_ok = False
+                                    if not auto_ok:
+                                        try:
+                                            dl_button(right_col, "Download PDF report", data=pdf_bytes, file_name=fname, mime="application/pdf", base=f"pdf_{fname}")
+                                        except Exception as e:
+                                            right_col.error(f"Could not create download button: {e}")
+                                    right_col.success("PDF generated.")
+                                    right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
                                 except Exception as e:
-                                    right_col.error(f"Could not create immediate download button: {e}")
+                                    right_col.error(f"PDF creation failed: {e}")
+                                    right_col.info("Common cause: missing kaleido or reportlab in the environment. Install them and restart Streamlit.")
+                                finally:
+                                    pdf_loading.empty()
+                        except Exception as e:
+                            right_col.error(f"Failed to create PDF: {e}")
 
-                            except Exception as e:
-                                right_col.error(f"PDF creation failed: {e}")
-                                right_col.info("Common cause: missing kaleido or reportlab in the Python environment that runs Streamlit.")
-                                right_col.info("Install in the same interpreter and restart Streamlit (run the install commands in the terminal used to start Streamlit).")
-                            finally:
-                                pdf_loading.empty()
+            except Exception as e:
+                # outer fetch + processing error
+                try:
+                    loader.empty()
+                except Exception:
+                    pass
+                left_col.error(f"Failed to fetch/process OBIS data: {e}")
 
-
-
-                    except Exception as e:
-                        right_col.error(f"Failed to create PDF: {e}")
-
-
-
-        except Exception as e:
-            loader.empty()
-            left_col.error(f"Failed to fetch OBIS data: {e}")
-
-    else:
-        # LLM decided to answer directly
-        ai_query = decision.get("query") or user_input
-        right_col.markdown("### AI Response")
-        right_col.markdown("<div class='muted'>AI interpreted your input as a question — here's the answer.</div>", unsafe_allow_html=True)
-        system_msg = {"role":"system","content":"You are a marine biology data assistant. Answer clearly and concisely."}
-        user_msg = {"role":"user","content":f"User input: {ai_query}"}
-        try:
-            with st.spinner("AI thinking..."):
-                reply = ask_openrouter([system_msg, user_msg])
-            right_col.markdown(reply)
-        except Exception as e:
-            right_col.error(f"AI request failed: {e}")
+        else:
+            # LLM decided to answer directly (not a 'search' action)
+            ai_query = decision.get("query") or user_input
+            right_col.markdown("### AI Response")
+            right_col.markdown("<div class='muted'>AI interpreted your input as a question — here's the answer.</div>", unsafe_allow_html=True)
+            system_msg = {"role": "system", "content": "You are a marine biology data assistant. Answer clearly and concisely."}
+            user_msg = {"role": "user", "content": f"User input: {ai_query}"}
+            try:
+                with st.spinner("AI thinking..."):
+                    reply = ask_openrouter([system_msg, user_msg])
+                right_col.markdown(reply)
+            except Exception as e:
+                right_col.error(f"AI request failed: {e}")
+# --- END enhanced handler ---
 
 # If a PDF was generated earlier in this session, show a persistent download button
 if st.session_state.get("last_pdf"):
