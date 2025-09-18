@@ -603,18 +603,22 @@ def prepare_pdf_download(df: pd.DataFrame, title="OBIS Report"):
 
 
 def make_plots_from_df(df: pd.DataFrame, species_name: str):
-    """Return a dict of plotly figures (map, timeseries, depth hist, density)."""
+    """Return a dict of plotly figures (map, timeseries, depth hist, density).
+    Extended: automatically detect environmental variables (temperature, salinity, oxygen)
+    and produce histograms and time-series (monthly means when possible). Keeps original plots.
+    """
     figs = {}
-    # Map scatter
+
+    # ---- Original map scatter (sample) ----
     if "decimalLongitude" in df.columns and "decimalLatitude" in df.columns:
-        map_df = df.dropna(subset=["decimalLongitude","decimalLatitude"])
+        map_df = df.dropna(subset=["decimalLongitude", "decimalLatitude"])
         sample_map = map_df if len(map_df) <= 1000 else map_df.sample(1000, random_state=1)
         figs["map"] = px.scatter_geo(
             sample_map,
             lon="decimalLongitude",
             lat="decimalLatitude",
             hover_name="scientificName" if "scientificName" in sample_map.columns else None,
-            hover_data=[c for c in ["eventDate","depth"] if c in sample_map.columns],
+            hover_data=[c for c in ["eventDate", "depth"] if c in sample_map.columns],
             title=f"{species_name} occurrences (sample)",
             projection="natural earth",
             height=550,
@@ -622,8 +626,7 @@ def make_plots_from_df(df: pd.DataFrame, species_name: str):
         figs["map"].update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"))
         _style_plotly_light(figs["map"])
 
-
-    # Time series (counts per year / month)
+    # ---- Original time series (counts) ----
     if "eventDate" in df.columns:
         try:
             df["eventDate_parsed"] = pd.to_datetime(df["eventDate"], errors="coerce")
@@ -642,46 +645,153 @@ def make_plots_from_df(df: pd.DataFrame, species_name: str):
         except Exception:
             pass
 
-
-    # Depth distribution
+    # ---- Original depth histogram ----
     if "depth" in df.columns:
         try:
             df_depth = df.dropna(subset=["depth"]).copy()
             if not df_depth.empty:
-                # coerce to numeric safely (handles ints, floats, numeric-strings, numpy types)
                 depth_nums = pd.to_numeric(df_depth["depth"], errors="coerce")
-                # keep only rows with valid numeric depth
                 valid_mask = depth_nums.notna()
                 df_depth = df_depth.loc[valid_mask].copy()
                 df_depth["depth_num"] = depth_nums[valid_mask].astype(float)
                 if not df_depth.empty:
                     figs["depth_hist"] = px.histogram(
-                        df_depth,
-                        x="depth_num",
-                        nbins=30,
-                        title="Depth distribution",
-                        height=300,
+                        df_depth, x="depth_num", nbins=30, title="Depth distribution", height=300,
                     )
-                    # ensure plot is visible on the dark-themed app
                     _style_plotly_light(figs["depth_hist"])
         except Exception as e:
-            # don't break the UI on plotting errors; log for debugging
             print("[WARN] depth plot failed:", e)
-            pass
 
-
-    # Density heatmap (lon/lat)
+    # ---- Original density heatmap (lon/lat) ----
     if "decimalLongitude" in df.columns and "decimalLatitude" in df.columns:
         try:
-            heat_df = df.dropna(subset=["decimalLongitude","decimalLatitude"])
+            heat_df = df.dropna(subset=["decimalLongitude", "decimalLatitude"])
             if len(heat_df) >= 20:
-                figs["density"] = px.density_heatmap(heat_df, x="decimalLongitude", y="decimalLatitude",
-                                                     nbinsx=60, nbinsy=40, title="Density heatmap (lon/lat)", height=400)
+                figs["density"] = px.density_heatmap(
+                    heat_df, x="decimalLongitude", y="decimalLatitude",
+                    nbinsx=60, nbinsy=40, title="Density heatmap (lon/lat)", height=400
+                )
                 figs["density"].update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         except Exception:
             pass
 
+    # ----------------- NEW: detect env variables and plot -----------------
+    # Keywords for common environmental columns
+    detect_map = {
+        "temperature": ["temp", "temperature", "sst", "sea_surface_temperature", "waterTemperature", "seaTemp"],
+        "salinity": ["salin", "salinity", "psal"],
+        "oxygen": ["oxygen", "do", "dissolved_oxygen", "dissolvedoxygen"]
+    }
+
+    # helper: find matched columns for a variable name (case-insensitive substring match)
+    def _find_cols_for_keywords(df_cols, keywords):
+        cols = []
+        for c in df_cols:
+            c_low = c.lower()
+            for kw in keywords:
+                if kw in c_low:
+                    cols.append(c)
+                    break
+        return cols
+
+    env_stats = {}  # simple summary stats for included vars
+
+    # iterate detection map and create hist + timeseries (if eventDate exists)
+    for var_name, keys in detect_map.items():
+        matched = _find_cols_for_keywords(df.columns, keys)
+        # If multiple matching columns, prefer exact match style or first numeric one
+        matched_numeric = []
+        for c in matched:
+            try:
+                # coerce to numeric to check suitability
+                s = pd.to_numeric(df[c].dropna(), errors="coerce").dropna()
+                if not s.empty:
+                    matched_numeric.append(c)
+            except Exception:
+                continue
+        if not matched_numeric:
+            continue
+        col = matched_numeric[0]
+
+        # create histogram
+        try:
+            ser = pd.to_numeric(df[col].dropna(), errors="coerce").dropna()
+            if not ser.empty:
+                figs[f"{var_name}_hist"] = px.histogram(
+                    ser, x=ser, nbins=30, title=f"{var_name.title()} distribution ({col})", labels={"x": var_name, "count": "Frequency"}, height=300
+                )
+                _style_plotly_light(figs[f"{var_name}_hist"])
+                # stats
+                env_stats[var_name] = {
+                    "column": col,
+                    "count": int(ser.size),
+                    "mean": float(ser.mean()),
+                    "median": float(ser.median()),
+                    "min": float(ser.min()),
+                    "max": float(ser.max()),
+                    "std": float(ser.std()),
+                }
+        except Exception:
+            pass
+
+        # create time-series monthly mean if eventDate present
+        if "eventDate" in df.columns:
+            try:
+                temp_df = df[[col, "eventDate"]].dropna(subset=[col, "eventDate"]).copy()
+                if not temp_df.empty:
+                    temp_df["eventDate_parsed"] = pd.to_datetime(temp_df["eventDate"], errors="coerce")
+                    temp_df = temp_df.dropna(subset=["eventDate_parsed"])
+                    if not temp_df.empty:
+                        temp_df["month"] = temp_df["eventDate_parsed"].dt.to_period("M").astype(str)
+                        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+                        ts = temp_df.groupby("month")[col].mean().reset_index(name="mean")
+                        if not ts.empty:
+                            figs[f"{var_name}_timeseries"] = px.line(
+                                ts, x="month", y="mean",
+                                title=f"Monthly mean {var_name.title()} ({col})",
+                                labels={"mean": var_name.title(), "month": "Month"},
+                                height=300
+                            )
+                            _style_plotly_light(figs[f"{var_name}_timeseries"])
+            except Exception:
+                pass
+
+    # ----- Generic numeric columns: find other numeric env-like columns and add small histograms -----
+    # Avoid re-plotting columns already included above (depth, longitude/latitude, standard columns)
+    skip_prefixes = set(["decimallongitude", "decimallatitude", "longitude", "latitude", "depth"])
+    plotted_cols = {v["column"].lower() for v in env_stats.values()} if env_stats else set()
+    for c in df.columns:
+        cl = c.lower()
+        if cl in plotted_cols:
+            continue
+        if any(p in cl for p in skip_prefixes):
+            continue
+        # try numeric
+        try:
+            s = pd.to_numeric(df[c].dropna(), errors="coerce").dropna()
+            if s.empty:
+                continue
+            # limit to columns that are likely environmental (short column name, not 'id' or 'count' etc.)
+            if len(s) >= 10 and len(c) > 2 and not any(x in cl for x in ["id", "url", "uri", "name", "taxon", "record"]):
+                key = f"numeric_{c}"
+                figs[key] = px.histogram(s, x=s, nbins=30, title=f"{c} distribution (auto)", height=260)
+                _style_plotly_light(figs[key])
+                env_stats[c] = {
+                    "column": c,
+                    "count": int(s.size),
+                    "mean": float(s.mean()),
+                    "min": float(s.min()),
+                    "max": float(s.max()),
+                }
+        except Exception:
+            continue
+
+    # Attach env stats if any (useful downstream for short summary or PDF)
+    if env_stats:
+        figs["env_stats"] = env_stats
+
     return figs
+
 
 
 def generate_pdf_report(df: pd.DataFrame, species_name: str, summary_text: str, figs: dict):
