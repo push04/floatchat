@@ -29,16 +29,6 @@ import tempfile
 # add near other imports at top of file
 import streamlit.components.v1 as components
 
-# Argo / NetCDF support
-try:
-    import xarray as xr
-except Exception:
-    xr = None
-
-try:
-    import netCDF4 as netCDF4  # optional; used in some parsing flows
-except Exception:
-    netCDF4 = None
 
 # -----------------------------
 # Session helpers: persist dataframe as plain Python (records + columns)
@@ -259,26 +249,6 @@ def _auto_download_pdf_bytes(pdf_bytes: bytes, filename: str):
         print("[WARN] auto-download failed:", e)
         return False
 
-
-def plot_profile_plotly(df: pd.DataFrame, profile_id) -> "go.Figure":
-    sub = df[df['profile_id'] == profile_id].sort_values('depth')
-    fig = go.Figure()
-    if 'temperature' in sub.columns and not sub['temperature'].dropna().empty:
-        fig.add_trace(go.Scatter(x=sub['temperature'], y=sub['depth'], mode='lines+markers', name='Temperature (°C)', yaxis='y1'))
-    if 'salinity' in sub.columns and not sub['salinity'].dropna().empty:
-        fig.add_trace(go.Scatter(x=sub['salinity'], y=sub['depth'], mode='lines+markers', name='Salinity', yaxis='y1', xaxis='x2'))
-    # layout: reversed depth axis
-    fig.update_layout(
-        xaxis=dict(title='Temperature (°C) / Salinity', side='bottom'),
-        yaxis=dict(autorange='reversed', title='Depth (m)'),
-        legend=dict(orientation='h')
-    )
-    _style_plotly_light(fig)
-    return fig
-
-
-
-
 def _style_plotly_light(fig):
     """
     Make a plotly figure clearly visible on a dark page by forcing a light
@@ -346,44 +316,6 @@ st.markdown(
     and biogeochemical variables — no complex tools required.
     """
 )
-
-# --- Argo / NetCDF UI (paste here) ---
-st.markdown("## Argo / NetCDF profile upload")
-uploaded = st.file_uploader("Upload NetCDF (.nc/.nc4) profile file", type=["nc","nc4"])
-argo_url = st.text_input("Or paste an Argo/THREDDS URL to a NetCDF file (optional)")
-if xr is None:
-    st.warning("xarray not installed — NetCDF support disabled. Install `xarray netCDF4` to enable.")
-# End of UI block
-
-# --- parse & preview control flow (paste here, directly after uploader) ---
-profiles_df = pd.DataFrame()
-if uploaded:
-    try:
-        ds = xr.open_dataset(uploaded) if xr else None
-    except Exception as e:
-        st.error(f"Failed to open uploaded NetCDF: {e}")
-        ds = None
-    if ds is not None:
-        profiles_df = parse_argo_netcdf_to_profiles(ds)
-
-elif argo_url:
-    try:
-        ds = xr.open_dataset(argo_url) if xr else None
-    except Exception as e:
-        st.error(f"Failed to open URL: {e}")
-        ds = None
-    if ds is not None:
-        profiles_df = parse_argo_netcdf_to_profiles(ds)
-
-# preview + plotting controls
-if not profiles_df.empty:
-    st.success(f"Parsed {profiles_df['profile_id'].nunique()} profiles, {len(profiles_df)} rows")
-    st.dataframe(profiles_df.head(100))
-    profile_ids = profiles_df['profile_id'].unique().tolist()
-    sel_profile = st.selectbox("Select profile to plot", options=profile_ids)
-    if st.button("Plot selected profile"):
-        fig = plot_profile_plotly(profiles_df, sel_profile)
-        st.plotly_chart(fig, use_container_width=True)
 
 
 st.markdown(
@@ -470,43 +402,6 @@ with st.sidebar:
     st.markdown("Advanced")
     auto_summary = st.checkbox("Auto-summarize after successful fetch", value=True)
     st.markdown("Built for FloatChat — IndOBIS + AI")
-
-
-def _find_possible_vars(ds: "xr.Dataset") -> dict:
-    """
-    Return probable mapping keys: {'temp': varname, 'sal': varname, 'pres': varname, 'lat': varname, 'lon': varname, 'time': varname}
-    """
-    if xr is None or ds is None:
-        return {}
-    # minimal stub: scan names for common substrings
-    mapping = {}
-    for v in ds.data_vars.keys():
-        lv = v.lower()
-        if 'temp' in lv or 'theta' in lv:
-            mapping.setdefault('temp', v)
-        if 'sal' in lv or 'psal' in lv:
-            mapping.setdefault('sal', v)
-        if 'pres' in lv or 'depth' in lv:
-            mapping.setdefault('pres', v)
-    for c in ds.coords.keys():
-        lc = c.lower()
-        if 'lon' in lc:
-            mapping.setdefault('lon', c)
-        if 'lat' in lc:
-            mapping.setdefault('lat', c)
-        if 'time' in lc:
-            mapping.setdefault('time', c)
-    return mapping
-
-def parse_argo_netcdf_to_profiles(nc_or_ds) -> pd.DataFrame:
-    """
-    Accept either a path / file-like / xarray.Dataset and return a tidy DataFrame:
-    columns at minimum: ['profile_id','time','depth','temperature','salinity','lat','lon'].
-    """
-    # TODO: open with xr.open_dataset if given a path; expand profile dims; return a dataframe
-    # Example return signature, replace with full logic:
-    return pd.DataFrame(columns=['profile_id','time','depth','temperature','salinity','lat','lon'])
-
 
 # -----------------------------
 # Helper functions
