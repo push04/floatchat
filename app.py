@@ -1379,21 +1379,21 @@ if submit and user_input.strip():
         # --- END measurement extraction & plotting ---
         
         except Exception as e:
-    # Close the outer try: which wrapped the fetch + measurement parsing.
-    # Warn the user and ensure variables used later exist so downstream code doesn't crash.
-    try:
-        left_col.warning(f"OBIS fetch/measurement processing failed: {e}")
-    except Exception:
-        # left_col may not be defined in some execution paths; ignore if so.
-        pass
-    # make sure df and response_json exist for later code
-    try:
-        import pandas as pd
-        df = pd.DataFrame()
-    except Exception:
-        df = []
-    response_json = {"results": []}
-    meas_rows = []
+            # Close the outer try: which wrapped the fetch + measurement parsing.
+            # Warn the user and ensure variables used later exist so downstream code doesn't crash.
+            try:
+                left_col.warning(f"OBIS fetch/measurement processing failed: {e}")
+            except Exception:
+                # left_col may not be defined in some execution paths; ignore if so.
+                pass
+            # make sure df and response_json exist for later code
+            try:
+                import pandas as pd
+                df = pd.DataFrame()
+            except Exception:
+                df = []
+            response_json = {"results": []}
+            meas_rows = []
 
             
 
