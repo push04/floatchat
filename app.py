@@ -28,6 +28,8 @@ import tempfile
 
 # add near other imports at top of file
 
+import re
+
 # --- NetCDF / xarray support (paste here) ---
 import xarray as xr
 from netCDF4 import Dataset
@@ -1252,7 +1254,139 @@ if submit and user_input.strip():
                 bbox = {"lonmin": lon_min, "lonmax": lon_max, "latmin": lat_min, "latmax": lat_max}
 
             df = fetch_obis_records(chosen_species, size=max_records, bbox=bbox)
+        
+        
+        
+        # --- START: OBIS measurement (eMoF) extraction & quick plots ---
+        # We fetch the raw OBIS JSON for the same query so we can inspect measurement/extendedMeasurement fields.
+        try:
+            # rebuild params similar to fetch_obis_records
+            params = {"scientificname": chosen_species, "size": max_records}
+            if bbox:
+                lonmin, lonmax, latmin, latmax = float(bbox["lonmin"]), float(bbox["lonmax"]), float(bbox["latmin"]), float(bbox["latmax"])
+                poly = f"POLYGON(({lonmin} {latmin}, {lonmax} {latmin}, {lonmax} {latmax}, {lonmin} {latmax}, {lonmin} {latmin}))"
+                params["geometry"] = poly
+            r_meas = requests.get(OBIS_API_URL, params=params, timeout=40)
+            r_meas.raise_for_status()
+            response_json = r_meas.json()
+        except Exception as e:
+            # If the extra JSON fetch fails, keep going with the already-fetched df and warn the user.
+            response_json = {"results": []}
+            left_col.warning(f"Could not fetch raw OBIS JSON for measurements: {e}")
+        
+        # Build a measurements table by scanning common keys used in OBIS occurrence objects
+        meas_rows = []
+        for rec in response_json.get("results", []):
+            occ_id = rec.get("occurrenceID") or rec.get("id") or rec.get("occurrence_id") or None
+            lon = rec.get("decimalLongitude") or rec.get("longitude") or None
+            lat = rec.get("decimalLatitude") or rec.get("latitude") or None
+            event_date = rec.get("eventDate") or rec.get("year") or None
+        
+            # keys that often contain measurement/eMoF info
+            for k in ("measurement", "measurements", "measurementOrFact", "extendedMeasurementOrFact", "emof", "extensions", "environment", "oceano"):
+                if k in rec and rec[k]:
+                    entries = rec[k] if isinstance(rec[k], list) else [rec[k]]
+                    for m in entries:
+                        # measurement shapes vary: be permissive
+                        mtype = (m.get("measurementType") or m.get("measurementTypeID") or m.get("type")
+                                 or m.get("measurementTypeLabel") or m.get("name") or "")
+                        mval = m.get("measurementValue") or m.get("value") or m.get("measurement_value") or None
+                        munit = (m.get("measurementUnit") or m.get("measurementUnitID") or m.get("unit")
+                                 or m.get("measurementUnitLabel") or "")
+                        # if a nested dict or string contains numbers, try to extract numeric
+                        if isinstance(mval, str):
+                            try:
+                                first_num = re.findall(r"[-+]?\d*\.\d+|\d+", mval)
+                                if first_num:
+                                    mval = float(first_num[0])
+                            except Exception:
+                                pass
+                        meas_rows.append({
+                            "occurrenceID": occ_id,
+                            "lon": lon,
+                            "lat": lat,
+                            "time": event_date,
+                            "measurementType": str(mtype),
+                            "value": mval,
+                            "unit": str(munit)
+                        })
+        
+        # Also look under extensions (some OBIS datasets put eMoF under rec['extensions'][<name>])
+        if not meas_rows:
+            for rec in response_json.get("results", []):
+                exts = rec.get("extensions") or {}
+                for ext_name, ext_rows in exts.items():
+                    if isinstance(ext_rows, list):
+                        for m in ext_rows:
+                            mtype = m.get("measurementType") or m.get("measurement_type") or m.get("type") or ""
+                            mval = m.get("measurementValue") or m.get("measurement_value") or m.get("value") or None
+                            munit = m.get("measurementUnit") or m.get("measurement_unit") or ""
+                            try:
+                                if isinstance(mval, str):
+                                    first_num = re.findall(r"[-+]?\d*\.\d+|\d+", mval)
+                                    if first_num:
+                                        mval = float(first_num[0])
+                            except Exception:
+                                pass
+                            meas_rows.append({
+                                "occurrenceID": rec.get("occurrenceID"),
+                                "lon": rec.get("decimalLongitude"),
+                                "lat": rec.get("decimalLatitude"),
+                                "time": rec.get("eventDate"),
+                                "measurementType": str(mtype),
+                                "value": mval,
+                                "unit": str(munit)
+                            })
+        
+        import pandas as _pd  # local alias to avoid shadowing if 'pd' is used elsewhere
+        df_meas = _pd.DataFrame(meas_rows)
+        
+        if df_meas.empty:
+            left_col.info("No eMoF/measurement rows found in the returned OBIS occurrences for this query. Try a wider bbox or use the OBIS Mapper export with measurements included.")
+        else:
+            # Normalize measurement type text for simple matching
+            df_meas["mtype_norm"] = df_meas["measurementType"].astype(str).str.lower().fillna("")
+            # heuristics to find temp / salinity
+            temp_mask = df_meas["mtype_norm"].str.contains("temp") | df_meas["unit"].astype(str).str.contains("c|°c", case=False, na=False)
+            sal_mask = df_meas["mtype_norm"].str.contains("salin") | df_meas["unit"].astype(str).str.contains("psu|ppt", case=False, na=False)
+        
+            df_temp = df_meas[temp_mask].dropna(subset=["value"]).copy()
+            df_sal = df_meas[sal_mask].dropna(subset=["value"]).copy()
+        
+            if not df_temp.empty:
+                left_col.markdown("### Temperature measurements (sample from OBIS eMoF)")
+                left_col.dataframe(df_temp.head(200))
+                # map of temperature points
+                fig_t = px.scatter_mapbox(df_temp, lon="lon", lat="lat", color="value",
+                                          hover_data=["occurrenceID", "time", "unit", "measurementType"],
+                                          title="OBIS: temperature measurements", height=450)
+                fig_t.update_layout(mapbox_style="open-street-map")
+                _style_plotly_light(fig_t)
+                left_col.plotly_chart(fig_t, use_container_width=True)
+                # histogram
+                left_col.plotly_chart(px.histogram(df_temp, x="value", nbins=40, title="Temperature distribution (OBIS)"), use_container_width=True)
+        
+            if not df_sal.empty:
+                left_col.markdown("### Salinity measurements (sample from OBIS eMoF)")
+                left_col.dataframe(df_sal.head(200))
+                fig_s = px.scatter_mapbox(df_sal, lon="lon", lat="lat", color="value",
+                                          hover_data=["occurrenceID", "time", "unit", "measurementType"],
+                                          title="OBIS: salinity measurements", height=450)
+                fig_s.update_layout(mapbox_style="open-street-map")
+                _style_plotly_light(fig_s)
+                left_col.plotly_chart(fig_s, use_container_width=True)
+                left_col.plotly_chart(px.histogram(df_sal, x="value", nbins=40, title="Salinity distribution (OBIS)"), use_container_width=True)
+        # --- END measurement extraction & plotting ---
+        
 
+
+
+
+
+
+            
+
+            
             # parse and filter by date range (if eventDate is present)
             if not df.empty and "eventDate" in df.columns:
                 try:
