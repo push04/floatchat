@@ -26,6 +26,9 @@ print(sys.executable)
 import matplotlib.pyplot as plt
 import tempfile
 
+# add near other imports at top of file
+import streamlit.components.v1 as components
+
 
 # -----------------------------
 # Session helpers: persist dataframe as plain Python (records + columns)
@@ -128,12 +131,18 @@ def plot_depth_distribution_plotly(df):
     if series.empty:
         return None
 
-    fig = px.histogram(series, x=series, nbins=30,
-                       title="Depth distribution",
-                       labels={"x": "Depth (m)", "count": "Frequency"},
-                       height=350)
-    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        fig = px.histogram(
+        series,
+        x=series,
+        nbins=30,
+        title="Depth distribution",
+        labels={"x": "Depth (m)", "count": "Frequency"},
+        height=350,
+    )
+    _style_plotly_light(fig)
     return fig
+
+
 
 
 
@@ -209,7 +218,62 @@ def _make_dl_key(base: str, filename: str) -> str:
     st.session_state["_dl_keys"] = existing
     return safe
 
+def _auto_download_pdf_bytes(pdf_bytes: bytes, filename: str):
+    """
+    Auto-trigger browser download of PDF bytes by creating a base64 data URL
+    and auto-clicking an invisible anchor via a small JS snippet.
+    """
+    try:
+        if not isinstance(pdf_bytes, (bytes, bytearray)):
+            # try to coerce
+            pdf_bytes = pdf_bytes.getvalue()
+        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        # create a minimal HTML snippet that auto-clicks a download link
+        html = f"""
+        <html>
+          <body>
+            <a id="dl" href="data:application/pdf;base64,{b64}" download="{filename}"></a>
+            <script>
+              const a = document.getElementById('dl');
+              if (a) {{
+                // click after a short timeout to let Streamlit render
+                setTimeout(() => a.click(), 50);
+              }}
+            </script>
+          </body>
+        </html>
+        """
+        components.html(html, height=0)
+        return True
+    except Exception as e:
+        print("[WARN] auto-download failed:", e)
+        return False
 
+def _style_plotly_light(fig):
+    """
+    Make a plotly figure clearly visible on a dark page by forcing a light
+    plot background and dark text/axes. Call this on every plotly figure
+    before showing or exporting it.
+    """
+    try:
+        if fig is None:
+            return
+        # use the clean white template so colors/lines are visible
+        fig.update_layout(
+            template="plotly_white",
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            font=dict(color="#06202a", size=11),
+            legend=dict(bgcolor="rgba(255,255,255,0.95)", bordercolor="#d1d5db", borderwidth=0.5)
+        )
+        # make axis grids subtle and readable
+        fig.update_xaxes(showgrid=True, gridcolor="#e6eef6", zerolinecolor="#e6eef6",
+                         tickcolor="#06202a", title_font=dict(color="#06202a"))
+        fig.update_yaxes(showgrid=True, gridcolor="#e6eef6", zerolinecolor="#e6eef6",
+                         tickcolor="#06202a", title_font=dict(color="#06202a"))
+    except Exception:
+        # be silent on styling errors so plots still render
+        pass
 
 
 def dl_button(container, label, data, file_name, mime, base="dl"):
@@ -555,8 +619,9 @@ def make_plots_from_df(df: pd.DataFrame, species_name: str):
             projection="natural earth",
             height=550,
         )
-        figs["map"].update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"),
-                                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        figs["map"].update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"))
+        _style_plotly_light(figs["map"])
+
 
     # Time series (counts per year / month)
     if "eventDate" in df.columns:
@@ -566,27 +631,44 @@ def make_plots_from_df(df: pd.DataFrame, species_name: str):
             if not times.empty:
                 times["year"] = times["eventDate_parsed"].dt.year
                 times["month"] = times["eventDate_parsed"].dt.to_period("M").astype(str)
+
                 yearly = times.groupby("year").size().reset_index(name="count")
                 figs["yearly"] = px.bar(yearly, x="year", y="count", title="Records per year", height=300)
+                _style_plotly_light(figs["yearly"])
+
                 monthly = times.groupby("month").size().reset_index(name="count").sort_values("month")
                 figs["monthly"] = px.line(monthly, x="month", y="count", title="Records per month (period)", height=300)
+                _style_plotly_light(figs["monthly"])
         except Exception:
             pass
+
 
     # Depth distribution
     if "depth" in df.columns:
         try:
-            df_depth = df.dropna(subset=["depth"])
+            df_depth = df.dropna(subset=["depth"]).copy()
             if not df_depth.empty:
-                # ensure numeric
-                df_depth = df_depth[df_depth["depth"].apply(lambda x: (isinstance(x, (int,float)) or (isinstance(x,str) and x.replace('.','',1).isdigit())))]
-
-                df_depth["depth_num"] = pd.to_numeric(df_depth["depth"], errors="coerce")
-                df_depth = df_depth.dropna(subset=["depth_num"])
+                # coerce to numeric safely (handles ints, floats, numeric-strings, numpy types)
+                depth_nums = pd.to_numeric(df_depth["depth"], errors="coerce")
+                # keep only rows with valid numeric depth
+                valid_mask = depth_nums.notna()
+                df_depth = df_depth.loc[valid_mask].copy()
+                df_depth["depth_num"] = depth_nums[valid_mask].astype(float)
                 if not df_depth.empty:
-                    figs["depth_hist"] = px.histogram(df_depth, x="depth_num", nbins=30, title="Depth distribution", height=300)
-        except Exception:
+                    figs["depth_hist"] = px.histogram(
+                        df_depth,
+                        x="depth_num",
+                        nbins=30,
+                        title="Depth distribution",
+                        height=300,
+                    )
+                    # ensure plot is visible on the dark-themed app
+                    _style_plotly_light(figs["depth_hist"])
+        except Exception as e:
+            # don't break the UI on plotting errors; log for debugging
+            print("[WARN] depth plot failed:", e)
             pass
+
 
     # Density heatmap (lon/lat)
     if "decimalLongitude" in df.columns and "decimalLatitude" in df.columns:
@@ -787,12 +869,20 @@ with left_col:
                 map_df = df_prev.dropna(subset=["decimalLongitude","decimalLatitude"])
                 if len(map_df) > 500:
                     map_df = map_df.sample(500, random_state=1)
-                fig = px.scatter_geo(map_df, lon="decimalLongitude", lat="decimalLatitude",
-                                     hover_name="scientificName", hover_data=["eventDate","depth"] if "eventDate" in df_prev.columns else None,
-                                     projection="natural earth", height=420)
-                fig.update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"),
-                                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
+                fig = px.scatter_geo(
+                map_df,
+                lon="decimalLongitude",
+                lat="decimalLatitude",
+                hover_name="scientificName",
+                hover_data=["eventDate","depth"] if "eventDate" in df_prev.columns else None,
+                projection="natural earth",
+                height=420,
+            )
+            # keep ocean color but enforce light styling so markers/axes are visible
+            fig.update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"))
+            _style_plotly_light(fig)
+            st.plotly_chart(fig, use_container_width=True)
+
 
             st.markdown("#### Sample cached records")
             st.dataframe(df_prev.head(200))
@@ -1032,6 +1122,23 @@ if submit and user_input.strip():
                         # persist summary so it doesn't vanish on rerun
                         st.session_state["last_summary"] = summary
                         right_col.markdown(summary)
+                        # auto-generate PDF and trigger download (non-blocking for UI)
+                        try:
+                            # ensure df_for_pdf and figs_local are available similarly to your Generate PDF flow
+                            df_for_pdf = load_obis_df()
+                            if df_for_pdf is not None and not df_for_pdf.empty:
+                                figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species", chosen_species))
+                                pdf_bytes_auto = generate_pdf_report(df_for_pdf, st.session_state.get("last_species", chosen_species), summary, figs_local)
+                                if isinstance(pdf_bytes_auto, (bytes, bytearray)) and len(pdf_bytes_auto) > 0:
+                                    # store for later and auto-download
+                                    fname_auto = f"{(st.session_state.get('last_species') or chosen_species).replace(' ','_')}_auto_report.pdf"
+                                    st.session_state["last_pdf"] = pdf_bytes_auto
+                                    st.session_state["last_pdf_name"] = fname_auto
+                                    _auto_download_pdf_bytes(pdf_bytes_auto, fname_auto)
+                        except Exception as e:
+                            # don't break UI on auto-download failure — keep existing UI
+                            print("[WARN] auto PDF-on-summary failed:", e)
+
                     except Exception as e:
                         right_col.error(f"Auto-summary failed: {e}")
                     finally:
@@ -1133,6 +1240,7 @@ if submit and user_input.strip():
 
                                 # store PDF in session for persistent download
                                 fname = f"{(st.session_state.get('last_species') or 'obis_report').replace(' ','_')}_report.pdf"
+                                # store PDF into session
                                 st.session_state["last_pdf"] = pdf_bytes
                                 st.session_state["last_pdf_name"] = fname
                                 st.session_state["last_pdf_species"] = st.session_state.get("last_species")
@@ -1140,12 +1248,33 @@ if submit and user_input.strip():
                                 right_col.success("PDF generated — you can download it below.")
                                 right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
 
-                                # immediate download (unique key)
+                                # create a normal download button for fallback / manual download
+                                # Try auto-download first (JS). If it fails, show a manual download button as fallback.
                                 try:
-                                    dl_button(right_col, "Download PDF report (immediate)", data=pdf_bytes, file_name=fname,
-                                            mime="application/pdf", base=f"pdf_{fname}")
-                                except Exception as e:
-                                    right_col.error(f"Could not create immediate download button: {e}")
+                                    auto_ok = _auto_download_pdf_bytes(pdf_bytes, fname)
+                                except Exception:
+                                    auto_ok = False
+
+                                right_col.success("PDF generated.")
+                                right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
+
+                                # If auto-download didn't work, provide the manual Streamlit download button as fallback
+                                if not auto_ok:
+                                    try:
+                                        dl_button(
+                                            right_col,
+                                            "Download PDF report",
+                                            data=pdf_bytes,
+                                            file_name=fname,
+                                            mime="application/pdf",
+                                            base=f"pdf_{fname}",
+                                        )
+                                    except Exception as e:
+                                        right_col.error(f"Could not create download button: {e}")
+                                else:
+                                    # user was auto-sent the file — optionally give a small note and avoid duplicate download buttons
+                                    right_col.markdown("<div class='small muted'>Auto-download attempted — check your browser downloads.</div>", unsafe_allow_html=True)
+
 
                                 # DO NOT clear the cached dataset here. Keep data for subsequent AI questions/downloads.
                             except Exception as e:
@@ -1177,7 +1306,9 @@ if submit and user_input.strip():
                             pdf_loading = right_col.empty()
                             pdf_loading.markdown("<div class='muted'><span class='pulse'></span> Rendering PDF...</div>", unsafe_allow_html=True)
                             try:
-                                pdf_bytes = generate_pdf_report(df_for_pdf, chosen_species, summary_text, figs)
+                                figs_local = make_plots_from_df(df_for_pdf, chosen_species)
+                                pdf_bytes = generate_pdf_report(df_for_pdf, chosen_species, summary_text, figs_local)
+
                                 # coerce to bytes if necessary
                                 if not isinstance(pdf_bytes, (bytes, bytearray)):
                                     try:
