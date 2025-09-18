@@ -226,7 +226,7 @@ def dl_button(container, label, data, file_name, mime, base="dl"):
 # -----------------------------
 # CONFIG (your provided key)
 # -----------------------------
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-8b-instruct:free"
 
