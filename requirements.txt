@@ -7,3 +7,6 @@ reportlab
 openpyxl
 matplotlib
 plotly.express
+xarray
+netcdf4
+dask
