@@ -27,6 +27,14 @@ import matplotlib.pyplot as plt
 import tempfile
 
 # add near other imports at top of file
+
+# --- NetCDF / xarray support (paste here) ---
+import xarray as xr
+from netCDF4 import Dataset
+import os
+# xarray uses numpy already imported in file
+
+
 import streamlit.components.v1 as components
 
 
@@ -154,6 +162,53 @@ def plot_occurrence_map(df):
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
     return fig
+
+
+# --- NetCDF plotting helpers (paste after existing plot functions) ---
+def plot_variable_map_from_ds(ds, var="temperature", time_index=0, depth_index=0):
+    """Return a plotly figure: map (lat/lon) of chosen var at specified time & depth indices."""
+    if var not in ds:
+        return None
+    da = ds[var].isel(time=time_index, depth=depth_index)
+    df = da.to_dataframe(name=var).reset_index()
+    # use px.scatter or px.density_mapbox; keep it simple with scatter
+    fig = px.scatter(df, x="lon", y="lat", color=var, size_max=6,
+                     title=f"{var} (time={ds.time.values[time_index]}, depth={float(ds.depth.values[depth_index])} m)")
+    _style_plotly_light(fig)
+    return fig
+
+def plot_variable_profile_at_point(ds, var="temperature", lon_val=None, lat_val=None, time_index=0):
+    """Return profile (var vs depth) at nearest grid point to lon_val/lat_val."""
+    if var not in ds:
+        return None
+    if lon_val is None or lat_val is None:
+        lon_val = float(ds.lon.mean())
+        lat_val = float(ds.lat.mean())
+    # find nearest indices
+    lon_idx = int(np.abs(ds.lon.values - lon_val).argmin())
+    lat_idx = int(np.abs(ds.lat.values - lat_val).argmin())
+    da = ds[var].isel(time=time_index, lat=lat_idx, lon=lon_idx)
+    prof = pd.DataFrame({"depth": ds.depth.values, var: da.values})
+    fig = px.line(prof, x=var, y="depth", title=f"{var} profile at lon={lon_val:.2f}, lat={lat_val:.2f}")
+    fig.update_yaxes(autorange="reversed")  # depth increasing downward
+    _style_plotly_light(fig)
+    return fig
+
+def plot_variable_timeseries_at_point(ds, var="temperature", lon_val=None, lat_val=None, depth_index=0):
+    """Timeseries of a var at a fixed point & depth."""
+    if var not in ds:
+        return None
+    if lon_val is None or lat_val is None:
+        lon_val = float(ds.lon.mean())
+        lat_val = float(ds.lat.mean())
+    lon_idx = int(np.abs(ds.lon.values - lon_val).argmin())
+    lat_idx = int(np.abs(ds.lat.values - lat_val).argmin())
+    da = ds[var].isel(depth=depth_index, lat=lat_idx, lon=lon_idx)
+    ts = pd.DataFrame({"time": ds.time.values, var: da.values})
+    fig = px.line(ts, x="time", y=var, title=f"{var} timeseries at lon={lon_val:.2f}, lat={lat_val:.2f}, depth={float(ds.depth.values[depth_index])}m")
+    _style_plotly_light(fig)
+    return fig
+
 
 def safe_rerun():
     """
@@ -285,6 +340,71 @@ def dl_button(container, label, data, file_name, mime, base="dl"):
     return container.download_button(label, data=data, file_name=file_name, mime=mime, key=key)
 
 
+# --- NetCDF dataset generator (paste just before CONFIG) ---
+def generate_ocean_netcdf(outfile_path,
+                          lon_min=68.0, lon_max=96.0,
+                          lat_min=6.0, lat_max=24.0,
+                          nx=40, ny=40,
+                          nt=12, start_date=None,
+                          depths=None, variables=None):
+    """
+    Create a synthetic but physically-plausible NetCDF with dims:
+      time, depth, lat, lon
+    Variables: temperature (C), salinity (PSU), optional others.
+    This function uses xarray to build and save the dataset.
+    """
+    # defaults
+    if start_date is None:
+        start_date = pd.to_datetime(date.today()).normalize()
+    if depths is None:
+        depths = np.array([0, 10, 20, 50, 100, 200])  # m
+    if variables is None:
+        variables = ["temperature", "salinity"]
+
+    # coords
+    lons = np.linspace(lon_min, lon_max, nx)
+    lats = np.linspace(lat_min, lat_max, ny)
+    times = pd.date_range(start=start_date, periods=nt, freq="MS")
+
+    # build toy fields (you can replace with real profiles later)
+    # shape: (time, depth, lat, lon)
+    shape = (len(times), len(depths), len(lats), len(lons))
+    # Base fields with simple depth & seasonal dependence
+    base_temp = 15.0  # surface baseline
+    temp = np.zeros(shape, dtype=np.float32)
+    salt = np.zeros(shape, dtype=np.float32)
+    for t_idx, t in enumerate(times):
+        # seasonal cycle
+        seasonal = 2.0 * np.sin(2 * np.pi * (t_idx / max(1, nt)))
+        for d_idx, d in enumerate(depths):
+            depth_decay = np.exp(-d / 50.0)  # shallower warmer
+            # add spatial gradients
+            lon_grad = (lons[np.newaxis, :] - lon_min) / (lon_max - lon_min)
+            lat_grad = (lats[:, np.newaxis] - lat_min) / (lat_max - lat_min)
+            grid = (lat_grad[:,:,None] * lon_grad[None,None,:]).astype(np.float32)
+            temp[t_idx, d_idx, :, :] = base_temp + seasonal + 8.0 * depth_decay + 0.5 * grid
+            salt[t_idx, d_idx, :, :] = 35.0 + 0.01 * d + 0.2 * grid  # simple salinity structure
+
+    data_vars = {}
+    if "temperature" in variables:
+        data_vars["temperature"] = (("time","depth","lat","lon"), temp)
+    if "salinity" in variables:
+        data_vars["salinity"] = (("time","depth","lat","lon"), salt)
+
+    coords = {
+        "time": times,
+        "depth": depths,
+        "lat": lats,
+        "lon": lons
+    }
+    ds = xr.Dataset(data_vars=data_vars, coords=coords)
+    # add basic metadata
+    ds.attrs["title"] = "FloatChat generated ocean dataset"
+    ds.attrs["created_by"] = "FloatChat"
+    # save NetCDF
+    ds.to_netcdf(outfile_path)
+    return ds
+
 
 
 # -----------------------------
@@ -394,6 +514,19 @@ with st.sidebar:
     if start_date and end_date and start_date > end_date:
         st.warning("Start date is after end date — results will be empty until corrected.")
 
+    # --- NetCDF generation controls (add into the sidebar block) ---
+    st.markdown("---")
+    st.markdown("## Generate NetCDF dataset (synthetic)")
+    gen_enable = st.checkbox("Enable NetCDF generator", value=False)
+    if gen_enable:
+        nc_nx = st.number_input("Longitude points (nx)", min_value=8, max_value=400, value=40, step=8)
+        nc_ny = st.number_input("Latitude points (ny)", min_value=8, max_value=400, value=40, step=8)
+        nc_nt = st.number_input("Time steps (nt)", min_value=1, max_value=48, value=12)
+        nc_depths_str = st.text_input("Depths (comma-separated, meters)", value="0,10,20,50,100,200")
+        nc_vars = st.multiselect("Variables", ["temperature","salinity","oxygen","nitrate"], default=["temperature","salinity"])
+
+
+    
     st.markdown("---")
     st.markdown("### OpenRouter / LLM")
     st.markdown(f"**Model:** {OPENROUTER_MODEL}")
@@ -1483,6 +1616,34 @@ if st.session_state.get("last_pdf"):
     except Exception as e:
         st.warning(f"PDF available but download button failed: {e}")
 
+# --- Trigger NetCDF creation and show plots (paste near data display area) ---
+if gen_enable:
+    depths = [float(x.strip()) for x in nc_depths_str.split(",") if x.strip()]
+    if st.button("Generate NetCDF and plots"):
+        tmpf = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
+        tmp_path = tmpf.name
+        tmpf.close()
+        ds = generate_ocean_netcdf(tmp_path,
+                                  lon_min=lon_min, lon_max=lon_max,
+                                  lat_min=lat_min, lat_max=lat_max,
+                                  nx=nc_nx, ny=nc_ny, nt=nc_nt,
+                                  start_date=start_date, depths=np.array(depths),
+                                  variables=nc_vars)
+        st.success(f"NetCDF created: {tmp_path} (dataset dims: {ds.dims})")
+        # Download button using your dl_button wrapper
+        with open(tmp_path, "rb") as fh:
+            data = fh.read()
+        dl_button(st, "Download NetCDF", data, file_name="floatchat_ocean.nc", mime="application/x-netcdf")
+        # Show quick plots
+        fig_map = plot_variable_map_from_ds(ds, var=nc_vars[0], time_index=0, depth_index=0)
+        if fig_map:
+            st.plotly_chart(fig_map, use_container_width=True)
+        fig_profile = plot_variable_profile_at_point(ds, var=nc_vars[0], lon_val=None, lat_val=None, time_index=0)
+        if fig_profile:
+            st.plotly_chart(fig_profile, use_container_width=True)
+        fig_ts = plot_variable_timeseries_at_point(ds, var=nc_vars[0], lon_val=None, lat_val=None, depth_index=0)
+        if fig_ts:
+            st.plotly_chart(fig_ts, use_container_width=True)
 
 
 
