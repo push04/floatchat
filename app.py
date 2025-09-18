@@ -759,12 +759,17 @@ st.markdown(
 with st.sidebar:
     st.markdown("## Controls")
     max_records = st.slider("Max records to fetch", min_value=10, max_value=1000, value=200, step=10)
+
+    # Bounding box inputs
     bbox_enable = st.checkbox("Filter by bounding box (lon/lat)", value=False)
-    if bbox_enable:
-        lon_min = st.number_input("Lon min", value=68.0, step=0.1, format="%.3f")
-        lon_max = st.number_input("Lon max", value=96.0, step=0.1, format="%.3f")
-        lat_min = st.number_input("Lat min", value=6.0, step=0.1, format="%.3f")
-        lat_max = st.number_input("Lat max", value=24.0, step=0.1, format="%.3f")
+    lon_min = st.number_input("Lon min", value=68.0, step=0.1, format="%.3f")
+    lon_max = st.number_input("Lon max", value=96.0, step=0.1, format="%.3f")
+    lat_min = st.number_input("Lat min", value=6.0, step=0.1, format="%.3f")
+    lat_max = st.number_input("Lat max", value=24.0, step=0.1, format="%.3f")
+
+    # Only apply if enabled
+    if not bbox_enable:
+        lon_min = lon_max = lat_min = lat_max = None
 
     st.markdown("---")
     st.markdown("## Date range (optional)")
