@@ -48,6 +48,165 @@ import streamlit.components.v1 as components
 # -----------------------------
 import numpy as np  # ensure numpy available for type checks
 
+
+# ------------------ A: general region/bbox helpers (paste after imports) ------------------
+import re
+from typing import Optional, Dict, Tuple
+
+def extract_bbox_from_text(text: str) -> Optional[Dict[str, float]]:
+    """Parse bbox from free text. Accepts patterns like:
+       'bbox=lonmin,lonmax,latmin,latmax' or 'bbox: lonmin, lonmax, latmin, latmax'."""
+    if not text:
+        return None
+    m = re.search(r"bbox\s*[:=]\s*([-\d+.]+)\s*,\s*([-\d+.]+)\s*,\s*([-\d+.]+)\s*,\s*([-\d+.]+)", text, flags=re.I)
+    if not m:
+        return None
+    try:
+        lonmin, lonmax, latmin, latmax = map(float, m.groups())
+        return {"lonmin": lonmin, "lonmax": lonmax, "latmin": latmin, "latmax": latmax}
+    except Exception:
+        return None
+
+# Small set of region presets (you can add more). These are conservative boxes.
+_REGION_PRESETS = {
+    "sri lanka": {"lonmin": 79.5, "lonmax": 82.5, "latmin": 5.5, "latmax": 10.0},
+    "indian ocean near srilanka": {"lonmin": 79.0, "lonmax": 83.0, "latmin": 4.5, "latmax": 10.5},
+    "bay of bengal": {"lonmin": 80.0, "lonmax": 93.0, "latmin": 5.0, "latmax": 22.0},
+    "arabian sea": {"lonmin": 50.0, "lonmax": 74.0, "latmin": 6.0, "latmax": 26.0},
+}
+
+def parse_region_to_bbox_general(text: str) -> Optional[Dict[str, float]]:
+    """Try to match simple region names or keywords in the user's text to a preset bbox.
+       If none matched, returns None."""
+    if not text:
+        return None
+    t = text.lower()
+    # direct preset match (substring)
+    for key, box in _REGION_PRESETS.items():
+        if key in t:
+            return box
+    # look for phrases like "near <placename>" (we won't geocode automatically here)
+    # caller can optionally attempt geocoding from the place name (see geocode_place below)
+    m = re.search(r"near\s+([A-Za-z0-9 \-,']{3,40})", text, flags=re.I)
+    if m:
+        place = m.group(1).strip()
+        # common trivial variants:
+        if "sri lanka" in place or "srilanka" in place:
+            return _REGION_PRESETS.get("sri lanka")
+        # unknown place -> return None (caller may try geocoding)
+    return None
+
+def geocode_place(place: str) -> Optional[Dict[str, float]]:
+    """(Optional) Try to geocode a place name to a bbox using Nominatim.
+       This performs a network request — keep it optional. If you don't want external calls remove/ignore this."""
+    try:
+        import requests
+        if not place:
+            return None
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": place, "format": "json", "limit": 1}
+        # lightweight user-agent
+        headers = {"User-Agent": "floatchat/1.0 (use responsibly)"}
+        r = requests.get(url, params=params, headers=headers, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        bb = data[0].get("boundingbox")  # [latmin, latmax, lonmin, lonmax]
+        latmin = float(bb[0]); latmax = float(bb[1]); lonmin = float(bb[2]); lonmax = float(bb[3])
+        return {"lonmin": lonmin, "lonmax": lonmax, "latmin": latmin, "latmax": latmax}
+    except Exception:
+        # network/geocode can fail; caller should handle None
+        return None
+# ------------------ END A ------------------
+
+# ------------------ B: plotting helper (paste after A) ------------------
+def plot_temp_salinity(df, container):
+    """Draw temperature & salinity maps + histograms into the given Streamlit container.
+       Detects likely column names and falls back gracefully."""
+    try:
+        import plotly.express as px
+    except Exception:
+        container.info("Plotly not installed — install plotly to see interactive charts.")
+        return
+
+    if df is None or df.empty:
+        container.info("No data available to plot.")
+        return
+
+    # Attempt to normalize common coordinate column names
+    if "longitude" in df.columns and "decimalLongitude" not in df.columns:
+        df = df.rename(columns={"longitude": "decimalLongitude"})
+    if "latitude" in df.columns and "decimalLatitude" not in df.columns:
+        df = df.rename(columns={"latitude": "decimalLatitude"})
+
+    # heuristics for temperature / salinity column names
+    temp_cols = [c for c in df.columns if "temp" in c.lower() or c.lower() in ("temperature", "sst")]
+    sal_cols = [c for c in df.columns if "salin" in c.lower() or c.lower() in ("salinity", "sss")]
+
+    temp_col = temp_cols[0] if temp_cols else None
+    sal_col = sal_cols[0] if sal_cols else None
+
+    # coerce numeric
+    if temp_col:
+        df[temp_col] = pd.to_numeric(df[temp_col], errors="coerce")
+    if sal_col:
+        df[sal_col] = pd.to_numeric(df[sal_col], errors="coerce")
+
+    has_coords = {"decimalLongitude", "decimalLatitude"}.issubset(set(df.columns))
+
+    # Temperature
+    if temp_col and df[temp_col].notna().any():
+        container.markdown("### Temperature measurements")
+        preview_cols = [c for c in ("occurrenceID", "decimalLongitude", "decimalLatitude", "eventDate", temp_col) if c in df.columns]
+        if preview_cols:
+            container.dataframe(df[preview_cols].head(200))
+        if has_coords:
+            p_df = df.dropna(subset=[temp_col, "decimalLongitude", "decimalLatitude"])
+            if not p_df.empty:
+                fig = px.scatter_mapbox(p_df, lon="decimalLongitude", lat="decimalLatitude", color=temp_col,
+                                        hover_data=[temp_col, "eventDate"], title=f"Temperature ({temp_col})", height=450)
+                fig.update_layout(mapbox_style="open-street-map")
+                try:
+                    _style_plotly_light(fig)
+                except Exception:
+                    pass
+                container.plotly_chart(fig, use_container_width=True)
+        # histogram
+        try:
+            container.plotly_chart(px.histogram(df[temp_col].dropna(), x=temp_col, nbins=40, title="Temperature distribution"), use_container_width=True)
+        except Exception:
+            pass
+    else:
+        container.info("No temperature measurements found in this dataset.")
+
+    # Salinity
+    if sal_col and df[sal_col].notna().any():
+        container.markdown("### Salinity measurements")
+        preview_cols = [c for c in ("occurrenceID", "decimalLongitude", "decimalLatitude", "eventDate", sal_col) if c in df.columns]
+        if preview_cols:
+            container.dataframe(df[preview_cols].head(200))
+        if has_coords:
+            p_df = df.dropna(subset=[sal_col, "decimalLongitude", "decimalLatitude"])
+            if not p_df.empty:
+                fig = px.scatter_mapbox(p_df, lon="decimalLongitude", lat="decimalLatitude", color=sal_col,
+                                        hover_data=[sal_col, "eventDate"], title=f"Salinity ({sal_col})", height=450)
+                fig.update_layout(mapbox_style="open-street-map")
+                try:
+                    _style_plotly_light(fig)
+                except Exception:
+                    pass
+                container.plotly_chart(fig, use_container_width=True)
+        try:
+            container.plotly_chart(px.histogram(df[sal_col].dropna(), x=sal_col, nbins=40, title="Salinity distribution"), use_container_width=True)
+        except Exception:
+            pass
+    else:
+        container.info("No salinity measurements found in this dataset.")
+# ------------------ END B ------------------
+
+
+
 def _sanitize_value(v):
     """Convert pandas / numpy / datetime types to plain Python (JSON-friendly) values."""
     try:
@@ -1351,16 +1510,61 @@ if submit and user_input.strip():
             try:
                 # prepare bbox if enabled (defensive casting)
                 bbox = None
-                if bbox_enable:
+                try:
+                    # explicit bbox in user input
+                    bbox = extract_bbox_from_text(user_input)
+                except Exception:
+                    bbox = None
+
+                if bbox is None:
+                    # region presets from free text (keyword-based)
                     try:
-                        bbox = {
-                            "lonmin": float(lon_min),
-                            "lonmax": float(lon_max),
-                            "latmin": float(lat_min),
-                            "latmax": float(lat_max),
-                        }
+                        bbox = parse_region_to_bbox_general(user_input)
                     except Exception:
                         bbox = None
+
+                # If still None, try to geocode a 'near <place>' phrase (best-effort; requires network & may be slow)
+                if bbox is None:
+                    try:
+                        m = re.search(r"near\s+([A-Za-z0-9 \-\,']{3,60})", user_input, flags=re.I)
+                        if m:
+                            place = m.group(1).strip()
+                            geoc = geocode_place(place)  # returns bbox or None
+                            if geoc:
+                                bbox = geoc
+                    except Exception:
+                        bbox = None
+
+                # final fallback: the UI bbox controls (unchanged behavior)
+                if bbox is None and bbox_enable:
+                    try:
+                        bbox = {"lonmin": float(lon_min), "lonmax": float(lon_max), "latmin": float(lat_min), "latmax": float(lat_max)}
+                    except Exception:
+                        bbox = None
+
+                # fetch occurrences from OBIS using your helper
+                df = fetch_obis_records(chosen_species, size=max_records, bbox=bbox)
+
+                # normalize possible coordinate column names so plotting helper finds them
+                if isinstance(df, (list, dict)):
+                    try:
+                        import pandas as _pd
+                        df = _pd.DataFrame(df)
+                    except Exception:
+                        pass
+
+                if hasattr(df, "rename"):
+                    try:
+                        df = df.rename(columns={"longitude": "decimalLongitude", "latitude": "decimalLatitude"})
+                    except Exception:
+                        pass
+
+                # attempt temperature/salinity plotting (non-fatal)
+                try:
+                    plot_temp_salinity(df, left_col)
+                except Exception:
+                    left_col.info("Environmental plotting (temperature/salinity) failed or no data available.")
+                # ------------------ END C ------------------
 
                 # fetch occurrences via your helper (may return DataFrame or None)
                 df = fetch_obis_records(chosen_species, size=max_records, bbox=bbox)
