@@ -1,0 +1,9 @@
+streamlit>=1.18
+requests
+pandas
+plotly
+kaleido
+reportlab
+openpyxl
+matplotlib
+plotly.express
