@@ -140,12 +140,34 @@ def geocode_place(place):
 def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon,
                                    end_date=None, days=30, start_year=None, end_year=None, debug=False):
     """
-    Fetch griddap timeseries for a (lat,lon) point. Returns DataFrame (possibly empty).
-    If debug=True returns (df, raw_attempts).
+    Robust griddap point fetch with automatic clamping to dataset time-axis minimum when ERDDAP rejects
+    an out-of-range start date. Returns DataFrame, or (DataFrame, raw_texts) if debug=True.
     """
     raw_texts = []
 
-    # Determine date window
+    def _iso_with_time(d):
+        return d.isoformat() + "T00:00:00Z"
+
+    # Extract axis minimum datetime from ERDDAP error text (if present)
+    def _extract_axis_minimum(text):
+        # Example message contains: axis minimum=2024-09-20T12:00:00Z
+        import re
+        m = re.search(r"axis ?minimum=([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)", text)
+        if m:
+            try:
+                return datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+            except Exception:
+                pass
+        # fallback: try a looser regex for ISO-like date
+        m2 = re.search(r"(20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z)", text)
+        if m2:
+            try:
+                return datetime.fromisoformat(m2.group(1).replace("Z", "+00:00"))
+            except Exception:
+                pass
+        return None
+
+    # Determine initial date window
     if start_year is not None and end_year is not None:
         start_date = datetime(int(start_year), 1, 1).date()
         end_date_obj = datetime(int(end_year), 12, 31).date()
@@ -158,95 +180,22 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon,
             end_date_obj = end_date
         start_date = end_date_obj - timedelta(days=days - 1)
 
-    start = start_date.isoformat() + "T00:00:00Z"
-    end = end_date_obj.isoformat() + "T00:00:00Z"
+    # Convert to ISO with time for griddap
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date_obj, datetime.min.time())
+    start_iso = _iso_with_time(start_dt.date())
+    end_iso = _iso_with_time(end_dt.date())
 
-    # try bbox attempts
-    attempt_bboxes = [BBOX_HALF_DEG, 0.25, 0.5, 1.0, 2.0]
-    orders = [("lat","lon"), ("lon","lat")]
-
-    for hb in attempt_bboxes:
-        lat_min = lat - hb
-        lat_max = lat + hb
-        lon_min = lon - hb
-        lon_max = lon + hb
-
-        for order in orders:
-            if order == ("lat","lon"):
-                bounds = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lat_min, lat_max, lon_min, lon_max)
-                # this builds as [lat][lon]
-            else:
-                bounds = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lon_min, lon_max, lat_min, lat_max)
-                # this builds as [lon][lat]
-
-            url = f"{server}/griddap/{dataset_id}.csv?{variable}[({start}):1:({end})]{bounds}"
-            try:
-                r = requests.get(url, timeout=90)
-                text = r.text if isinstance(r.text, str) else ''
-                raw_texts.append((url, text[:60000] if text else f"HTTP {r.status_code}"))
-                if r.status_code != 200:
-                    continue
-                df = pd.read_csv(io.StringIO(r.text))
-
-                # Normalize names and coerce numeric types
-                col_lower = {c.lower(): c for c in df.columns}
-                if 'time' in col_lower:
-                    df.rename(columns={col_lower['time']: 'time'}, inplace=True)
-                    df['time'] = pd.to_datetime(df['time'], errors='coerce')
-
-                # lat normalization
-                if 'latitude' in col_lower:
-                    df.rename(columns={col_lower['latitude']: 'latitude'}, inplace=True)
-                elif 'lat' in col_lower:
-                    df.rename(columns={col_lower['lat']: 'latitude'}, inplace=True)
-                elif 'y' in col_lower:
-                    df.rename(columns={col_lower['y']: 'latitude'}, inplace=True)
-
-                # lon normalization
-                if 'longitude' in col_lower:
-                    df.rename(columns={col_lower['longitude']: 'longitude'}, inplace=True)
-                elif 'lon' in col_lower:
-                    df.rename(columns={col_lower['lon']: 'longitude'}, inplace=True)
-                elif 'x' in col_lower:
-                    df.rename(columns={col_lower['x']: 'longitude'}, inplace=True)
-
-                # Coerce lat/lon to numeric (safe)
-                if 'latitude' in df.columns:
-                    df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-                if 'longitude' in df.columns:
-                    df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-
-                # Convert value columns to numeric where possible
-                value_cols = [c for c in df.columns if c not in ('time', 'latitude', 'longitude')]
-                for c in value_cols:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
-
-                if 'time' in df.columns:
-                    df = df.dropna(subset=['time'])
-
-                if not df.empty:
-                    if debug:
-                        return df, raw_texts
-                    return df
-            except Exception as e:
-                raw_texts.append((url, f"EXCEPTION: {e}"))
-                continue
-
-    # final attempt: exact point
-    for order in orders:
-        if order == ("lat","lon"):
-            point_idx = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lat, lat, lon, lon)
-        else:
-            point_idx = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lon, lon, lat, lat)
-        url = f"{server}/griddap/{dataset_id}.csv?{variable}[({start}):1:({end})]{point_idx}"
+    # Internal routine to attempt a single URL and return df or None (but append raw_texts)
+    def _attempt_request(url):
         try:
             r = requests.get(url, timeout=90)
             text = r.text if isinstance(r.text, str) else ''
             raw_texts.append((url, text[:60000] if text else f"HTTP {r.status_code}"))
             if r.status_code != 200:
-                continue
+                return None, r
             df = pd.read_csv(io.StringIO(r.text))
-
+            # Normalize names and coerce numeric types
             col_lower = {c.lower(): c for c in df.columns}
             if 'time' in col_lower:
                 df.rename(columns={col_lower['time']: 'time'}, inplace=True)
@@ -264,25 +213,97 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon,
                 df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
             if 'longitude' in df.columns:
                 df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+
             value_cols = [c for c in df.columns if c not in ('time', 'latitude', 'longitude')]
             for c in value_cols:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
 
             if 'time' in df.columns:
                 df = df.dropna(subset=['time'])
-            if not df.empty:
+
+            if df.empty:
+                return None, r
+            return df, r
+        except Exception as e:
+            raw_texts.append((url, f"EXCEPTION: {e}"))
+            return None, None
+
+    # Try multiple bbox sizes and ordering; if a 404 states the start is earlier than axis minimum,
+    # extract min and retry once with clamped start.
+    attempt_bboxes = [BBOX_HALF_DEG, 0.25, 0.5, 1.0, 2.0]
+    orders = [("lat", "lon"), ("lon", "lat")]
+    tried_clamp = False
+    # We'll allow two main passes: initial requested start, and (optionally) clamped start from server hint
+    for pass_num in (1, 2):
+        for hb in attempt_bboxes:
+            lat_min = lat - hb
+            lat_max = lat + hb
+            lon_min = lon - hb
+            lon_max = lon + hb
+
+            for order in orders:
+                if order == ("lat", "lon"):
+                    bounds = f"[({lat_min}):1:({lat_max})][({lon_min}):1:({lon_max})]"
+                else:
+                    bounds = f"[({lon_min}):1:({lon_max})][({lat_min}):1:({lat_max})]"
+
+                url = f"{server}/griddap/{dataset_id}.csv?{variable}[({start_iso}):1:({end_iso})]{bounds}"
+                df, resp = _attempt_request(url)
+                if df is not None:
+                    if debug:
+                        return df, raw_texts
+                    return df
+                # If we got a response and it's a 404 with a start<axis-min message, try to extract axis min and clamp
+                if resp is not None and resp.status_code == 404 and not tried_clamp:
+                    text = resp.text if isinstance(resp.text, str) else ''
+                    axis_min_dt = _extract_axis_minimum(text)
+                    if axis_min_dt:
+                        # clamp start to axis_min (use date part)
+                        axis_min_date = axis_min_dt.date()
+                        start_iso = _iso_with_time(axis_min_date)
+                        tried_clamp = True
+                        # proceed to next attempt with clamped start (pass_num will iterate)
+                        # break inner loop to start attempts with clamped start immediately
+                        break
+            else:
+                # continue outer hb loop if not broken for clamp
+                continue
+            # if we broke due to clamp, break hb loop to restart with clamped start
+            break
+        else:
+            # completed all hb attempts without clamp-trigger; if no clamp was tried and no data, move to next pass (nothing changes)
+            pass
+        # if we triggered clamp, the start_iso has been adjusted and the outer for will run second pass
+        # if clamped already tried or no clamp, next iteration either repeats or ends
+    # final exact-point attempts (same clamp logic)
+    for pass_num in (1, 2):
+        for order in orders:
+            if order == ("lat", "lon"):
+                point_idx = f"[({lat}):1:({lat})][({lon}):1:({lon})]"
+            else:
+                point_idx = f"[({lon}):1:({lon})][({lat}):1:({lat})]"
+            url = f"{server}/griddap/{dataset_id}.csv?{variable}[({start_iso}):1:({end_iso})]{point_idx}"
+            df, resp = _attempt_request(url)
+            if df is not None:
                 if debug:
                     return df, raw_texts
                 return df
-        except Exception as e:
-            raw_texts.append((url, f"EXCEPTION: {e}"))
+            if resp is not None and resp.status_code == 404 and not tried_clamp:
+                axis_min_dt = _extract_axis_minimum(resp.text if isinstance(resp.text, str) else '')
+                if axis_min_dt:
+                    axis_min_date = axis_min_dt.date()
+                    start_iso = _iso_with_time(axis_min_date)
+                    tried_clamp = True
+                    break
+        if tried_clamp:
             continue
+        else:
+            break
 
-    # nothing found
+    # nothing found; return debug info if requested, otherwise empty DF
     if debug:
         return pd.DataFrame(), raw_texts
     return pd.DataFrame()
-
 
 # -------------------------
 # Variable mappings & preferences
