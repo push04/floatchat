@@ -39,6 +39,32 @@ ERDDAP_SERVER = "https://coastwatch.pfeg.noaa.gov/erddap"
 # small bbox half-width (deg) to capture nearest grid cell
 BBOX_HALF_DEG = 0.125
 
+def get_dataset_variables(server, dataset_id, timeout=20):
+    """
+    Query ERDDAP info page CSV for a dataset and return a list of variable names (destination names).
+    Returns list of strings (may be empty) or raises on network errors.
+    """
+    try:
+        url = f"{server}/info/{dataset_id}/index.csv"
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        # common column labels for variable name appear in different servers:
+        # look for 'Variable Name' or 'VariableName' or 'variableName' (normalized)
+        cols = [c for c in df.columns if 'variable' in c.lower() and 'name' in c.lower()]
+        if not cols:
+            # fallback: show all columns to inspect (keep safe)
+            return []
+        var_col = cols[0]
+        # the index.csv includes rows for 'variable' entries; extract distinct names
+        vars_list = df[var_col].dropna().astype(str).unique().tolist()
+        # often the first block includes header rows like 'variable', 'attribute' etc.;
+        # filter out rows that contain whitespace or column headings
+        vars_list = [v.strip() for v in vars_list if v.strip() and len(v.strip()) < 120]
+        return vars_list
+    except Exception as e:
+        print(f"[get_dataset_variables] failed: {e}")
+        return []
 
 # -------------------------
 # Utils
