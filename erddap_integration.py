@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 try:
     from geopy.geocoders import Nominatim
     GEOPY_AVAILABLE = True
-except Exception:
+except ImportError:
     GEOPY_AVAILABLE = False
 
 # Default ERDDAP server (NOAA CoastWatch). Change if you want a different host.
@@ -34,12 +34,12 @@ def _parse_iso_z(s):
     try:
         if s.endswith("Z"):
             return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
-        return datetime.fromisoformat(s).astimezone(timezone.utc)
-    except Exception:
-        try:
-            return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
 
 # -------------------------
@@ -69,7 +69,7 @@ def get_dataset_variables(server, dataset_id, timeout=8):
         var_col = cols[0]
         vars_list = df[var_col].dropna().astype(str).unique().tolist()
         return [v.strip() for v in vars_list if v.strip()]
-    except Exception:
+    except requests.exceptions.RequestException:
         return []
 
 
@@ -103,7 +103,7 @@ def discover_erddap_datasets(server=ERDDAP_SERVER, keyword="sst", max_results=20
                 return df[['dataset_id', 'title']].drop_duplicates().reset_index(drop=True)
             return df[['dataset_id']].drop_duplicates().reset_index(drop=True)
         return pd.DataFrame()
-    except Exception:
+    except requests.exceptions.RequestException:
         return pd.DataFrame()
 
 
@@ -129,7 +129,7 @@ def geocode_place(place):
         j = r.json()
         if isinstance(j, list) and len(j) > 0:
             return float(j[0].get("lat")), float(j[0].get("lon"))
-    except Exception:
+    except requests.exceptions.RequestException:
         pass
     return None
 
@@ -214,12 +214,12 @@ def get_dataset_time_range(server, dataset_id, timeout=8):
                     return dts[0], dts[-1]
         except Exception:
             pass
-    except Exception:
+    except requests.exceptions.RequestException:
         pass
 
     # 2) Probe griddap with a very wide time window to elicit axis hints (catch 404 text)
     try:
-        probe_url = f"{server}/griddap/{dataset_id}.csv?time[(1900-01-01T00:00:00Z):1:({(datetime.utcnow()+timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')})][(0):1:(0)][(0):1:(0)]"
+        probe_url = f"{server}/griddap/{dataset_id}.csv?time[(1900-01-01T00:00:00Z):1:({(datetime.now(timezone.utc)+timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')})][(0):1:(0)][(0):1:(0)]"
         r = requests.get(probe_url, timeout=20)
         text = r.text if isinstance(r.text, str) else ''
         if r.status_code == 200:
@@ -229,11 +229,11 @@ def get_dataset_time_range(server, dataset_id, timeout=8):
                 if 'time' in [c.lower() for c in df.columns]:
                     df_cols = {c.lower(): c for c in df.columns}
                     df.rename(columns={df_cols.get('time'): 'time'}, inplace=True)
-                    df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                    df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
                     df = df.dropna(subset=['time'])
                     if not df.empty:
-                        mn = df['time'].min().to_pydatetime().astimezone(timezone.utc)
-                        mx = df['time'].max().to_pydatetime().astimezone(timezone.utc)
+                        mn = df['time'].min().to_pydatetime()
+                        mx = df['time'].max().to_pydatetime()
                         return mn, mx
             except Exception:
                 pass
@@ -257,7 +257,7 @@ def get_dataset_time_range(server, dataset_id, timeout=8):
                         axis_max = dts[-1]
         if axis_min or axis_max:
             return axis_min, axis_max
-    except Exception:
+    except requests.exceptions.RequestException:
         pass
 
     return None, None
@@ -276,16 +276,20 @@ def fetch_griddap_point_timeseries_using_dataset_time(server, dataset_id, variab
 
     # 1) get dataset time range
     start_dt, end_dt = get_dataset_time_range(server, dataset_id)
-    # If not found, fallback to a conservative short window (last 30 days)
-    if start_dt is None and end_dt is None:
-        end_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    
+    if start_dt is None or end_dt is None:
+        end_dt = now
         start_dt = end_dt - timedelta(days=30)
-    elif start_dt is None and end_dt is not None:
-        end_dt = end_dt.astimezone(timezone.utc)
-        start_dt = end_dt - timedelta(days=30)
-    elif start_dt is not None and end_dt is None:
-        start_dt = start_dt.astimezone(timezone.utc)
-        end_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+    
+    # Ensure start_dt and end_dt are within the dataset's available range
+    if start_dt > now: # If start date is in the future, fallback to latest data
+        end_dt = now
+        start_dt = now - timedelta(days=1)
+    
+    if end_dt > now: # If end date is in the future, set it to now
+        end_dt = now
+
 
     def _to_iso(dt):
         if dt is None:
@@ -318,7 +322,7 @@ def fetch_griddap_point_timeseries_using_dataset_time(server, dataset_id, variab
             col_lower = {c.lower(): c for c in df.columns}
             if 'time' in col_lower:
                 df.rename(columns={col_lower['time']: 'time'}, inplace=True)
-                df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
             if 'latitude' in col_lower:
                 df.rename(columns={col_lower['latitude']: 'latitude'}, inplace=True)
             elif 'lat' in col_lower:
@@ -341,7 +345,7 @@ def fetch_griddap_point_timeseries_using_dataset_time(server, dataset_id, variab
             if debug:
                 return df, raw_texts
             return df
-        except Exception:
+        except requests.exceptions.RequestException:
             continue
 
     if debug:
@@ -448,7 +452,10 @@ def timeseries_plot(df, variable):
         coord_str = f" @ {median_lat:.3f},{median_lon:.3f}"
     else:
         if 'latitude' in df.columns and 'longitude' in df.columns:
-            coord_str = f" @ {str(df['latitude'].iloc[0])},{str(df['longitude'].iloc[0])}"
+            try:
+                coord_str = f" @ {str(df['latitude'].iloc[0])},{str(df['longitude'].iloc[0])}"
+            except IndexError:
+                coord_str = ""
     fig = px.line(df.sort_values('time'), x='time', y=varcol, title=f"{varcol}{coord_str}")
     fig.update_xaxes(rangeslider_visible=True)
     return fig
@@ -566,7 +573,7 @@ def cli_fetch_and_print(args):
 def erddap_streamlit_widget(server=ERDDAP_SERVER):
     try:
         import streamlit as st
-    except Exception:
+    except ImportError:
         return
     st.sidebar.header('Ocean data (ERDDAP)')
     var_choice = st.sidebar.selectbox('Variable', list(DEFAULT_VARIABLES.keys()))
@@ -584,7 +591,7 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
             try:
                 parts = [p.strip() for p in manual_latlon.split(',')]
                 latlon = (float(parts[0]), float(parts[1]))
-            except Exception:
+            except (ValueError, IndexError):
                 st.error('Manual lat,lon parse failed. Use format: lat,lon')
                 return
         elif place and place.strip():
@@ -654,14 +661,14 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
                     break
             if val is not None:
                 st.metric(label=f"Latest {varname}", value=f"{float(val):.3f}")
-        except Exception:
+        except (ValueError, KeyError):
             pass
 
 
 def register_erddap_blueprint(app, server=ERDDAP_SERVER):
     try:
         from flask import Blueprint, request, render_template_string
-    except Exception:
+    except ImportError:
         return
     bp = Blueprint('erddap_integration', __name__, template_folder='templates')
     FORM_HTML = """
@@ -695,7 +702,7 @@ def register_erddap_blueprint(app, server=ERDDAP_SERVER):
                 try:
                     p = [x.strip() for x in manual.split(',')]
                     latlon = (float(p[0]), float(p[1]))
-                except Exception:
+                except (ValueError, IndexError):
                     latlon = None
             elif place:
                 g = geocode_place(place)
