@@ -531,7 +531,7 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
         st.info(f"Fetching {var_choice} for {lat:.3f},{lon:.3f} between {_format_iso(start_dt)} and {_format_iso(end_dt)}")
         # Discover dataset heuristics (simple)
         heuristics = {
-            "Temperature": (["sea surface temperature", "sst"], ["analysed_sst","sea_surface_temperature","sst","temperature"]),
+            "Temperature": (["sea surface temperature", "sst"], ["analysed_sst","sea_surface_temperature","sst","temperature","sstAnom","sst_anom"]),
             "Salinity": (["salinity", "sss"], ["salinity","sea_surface_salinity","sss"]),
             "Chlorophyll": (["chlorophyll", "chlor a", "chl"], ["chlor_a","chl","CHL_Weekly","chlorophyll"])
         }
