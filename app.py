@@ -40,39 +40,7 @@ import streamlit.components.v1 as components
 from erddap_integration import erddap_streamlit_widget
 
 
-"""
-ERDDAP integration helper for floatchat/app.py
 
-INSTRUCTIONS (paste these lines into your repo):
-1) Create a new file at the root of the project: `erddap_integration.py` and paste this whole file there.
-2) Install required packages if not present:
-   pip install pandas requests plotly geopy
-
-3a) If your app is a Streamlit app: open app.py and *only* add the following two lines near the top (after other imports):
-   from erddap_integration import erddap_streamlit_widget
-
-   And then inside your main UI rendering function (where the Streamlit widgets live), add a single call:
-   erddap_streamlit_widget()
-
-   That is the only modification required in app.py for Streamlit integration.
-
-3b) If your app is a Flask (or other WSGI) app: add these two lines near app initialization:
-   from erddap_integration import register_erddap_blueprint
-   register_erddap_blueprint(app)
-
-   This will mount a small blueprint at /erddap which provides a form, results and Plotly charts.
-
-IMPORTANT: This module only *adds* new functions/routes/UI. It does not modify any of your existing functions.
-
-USAGE:
-- Streamlit: the widget will show an options select for variables (temperature, salinity, chlorophyll), a place text box (or manual lat/lon), timeframe, and render interactive Plotly charts.
-- Flask: visit /erddap, submit the form and see charts.
-
-Notes on behavior:
-- The code auto-discovers ERDDAP datasets by keyword using the ERDDAP search endpoint. It will try to choose a dataset containing the requested variable. If discovery fails, you'll be prompted to specify a dataset_id.
-- For geocoding a place name we use Nominatim (geopy). If not available or rate-limited, use the "Manual lat,lon" text input.
-
-"""
 
 from datetime import datetime, timedelta
 import math
