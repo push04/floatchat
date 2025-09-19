@@ -1,6 +1,6 @@
 # erddap_integration.py
-# ERDDAP helper that automatically switches between historical and near-real-time (NRT)
-# datasets and allows querying by month and year.
+# COMPLETE SCRIPT: ERDDAP helper that automatically switches between historical and near-real-time (NRT)
+# datasets. Includes updated CLI, Streamlit, and Flask interfaces with a new month-year query option.
 
 from datetime import datetime, timedelta, timezone
 import calendar
@@ -33,7 +33,6 @@ DATASET_STRATEGY = {
         'nrt': ('noaacwLEOACSPOSSTL3SnrtCDaily', 'sea_surface_temperature')
     },
     'Salinity': {
-        # Using the same dataset for both as an example; can be changed.
         'historical': ('NCOM_amseas_latest3d', 'salinity'),
         'nrt': ('NCOM_amseas_latest3d', 'salinity')
     },
@@ -71,7 +70,7 @@ def geocode_place(place):
     """Return (lat, lon) from place name. Returns None on failure."""
     if GEOPY_AVAILABLE:
         try:
-            geolocator = Nominatim(user_agent="floatchat_erddap_integration")
+            geolocator = Nominatim(user_agent="floatchat_erddap_integration_full")
             loc = geolocator.geocode(place, timeout=10)
             if loc:
                 return float(loc.latitude), float(loc.longitude)
@@ -80,7 +79,7 @@ def geocode_place(place):
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": place, "format": "json", "limit": 1}
-        headers = {"User-Agent": "floatchat_erddap_integration/1.0"}
+        headers = {"User-Agent": "floatchat_erddap_integration_full/1.0"}
         r = requests.get(url, params=params, headers=headers, timeout=10)
         r.raise_for_status()
         j = r.json()
@@ -114,7 +113,6 @@ def _fetch_erddap_data(server, dataset_id, variable, lat, lon, start_iso, end_is
                 continue
 
             df = pd.read_csv(io.StringIO(r.text))
-            # Standardize column names
             col_map = {c.lower(): c for c in df.columns}
             rename_dict = {}
             if 'time' in col_map: rename_dict[col_map['time']] = 'time'
@@ -126,56 +124,76 @@ def _fetch_erddap_data(server, dataset_id, variable, lat, lon, start_iso, end_is
                 df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
                 df = df.dropna(subset=['time'])
 
+            # Add the variable name as a column for clarity in plotting
+            data_cols = [c for c in df.columns if c.lower() not in ['time', 'latitude', 'longitude']]
+            if data_cols:
+                df.rename(columns={data_cols[0]: variable}, inplace=True)
+
             if not df.empty:
-                return (df, raw_texts) if debug else df
+                return (df, raw_texts, dataset_id, variable) if debug else df
 
         except requests.exceptions.RequestException:
             continue
-
-    return (pd.DataFrame(), raw_texts) if debug else pd.DataFrame()
+    
+    empty_result = (pd.DataFrame(), raw_texts, dataset_id, variable) if debug else pd.DataFrame()
+    return empty_result
 
 def fetch_data_with_strategy(server, friendly_variable, lat, lon, start_dt, end_dt, debug=False):
     """
     Selects dataset based on time range and fetches data.
-    - Uses NRT dataset for recent queries.
-    - Uses historical dataset for older queries.
     """
     if friendly_variable not in DATASET_STRATEGY:
-        print(f"Error: Variable '{friendly_variable}' not configured in DATASET_STRATEGY.")
+        print(f"Error: Variable '{friendly_variable}' not configured.")
         return pd.DataFrame()
 
     strategy = DATASET_STRATEGY[friendly_variable]
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=NRT_CUTOFF_DAYS)
-
-    if start_dt < cutoff_date:
-        print("Query is for historical data, using historical dataset.")
+    
+    use_historical = start_dt < cutoff_date
+    if use_historical:
         dataset_id, varname = strategy['historical']
+        print("Query is for historical data, using historical dataset.")
     else:
-        print("Query is for recent data, using Near-Real-Time (NRT) dataset.")
         dataset_id, varname = strategy['nrt']
+        print("Query is for recent data, using Near-Real-Time (NRT) dataset.")
     
     print(f"Using dataset: {dataset_id}, variable: {varname}")
-
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return _fetch_erddap_data(server, dataset_id, varname, lat, lon, start_iso, end_iso, debug)
 
-
 # -------------------------
 # Plot helpers
 # -------------------------
-def timeseries_plot(df, variable):
+def timeseries_plot(df):
     if df.empty:
         return go.Figure().update_layout(title='No data to display')
     
     data_cols = [c for c in df.columns if c.lower() not in ['time', 'latitude', 'longitude']]
     varcol = data_cols[0] if data_cols else None
     if not varcol:
-        return go.Figure().update_layout(title='No data variable found in results')
+        return go.Figure().update_layout(title='No data variable found')
         
     fig = px.line(df.sort_values('time'), x='time', y=varcol, title=f"Timeseries for {varcol}")
     fig.update_xaxes(rangeslider_visible=True)
+    return fig
+
+def map_scatter_plot(df):
+    if df.empty or 'latitude' not in df.columns or 'longitude' not in df.columns:
+        return go.Figure().update_layout(title='No spatial data to display')
+
+    data_cols = [c for c in df.columns if c.lower() not in ['time', 'latitude', 'longitude']]
+    varcol = data_cols[0] if data_cols else None
+    if not varcol:
+        return go.Figure().update_layout(title='No data variable found')
+
+    df_latest = df.loc[df['time'].idxmax()].to_frame().T
+    
+    fig = px.scatter_geo(df_latest, lat='latitude', lon='longitude', size_max=15,
+                         hover_name=varcol, hover_data=['time'],
+                         projection='natural earth')
+    fig.update_layout(title=f"Map of {varcol} (Latest Point)")
     return fig
 
 # -------------------------
@@ -196,11 +214,8 @@ def summarize_df(df, nrows=10):
         ser = pd.to_numeric(df[data_col], errors='coerce').dropna()
         if not ser.empty:
             txt.append(f"\nSummary statistics for {data_col}:")
-            txt.append(f"  Mean: {ser.mean():.3f}")
-            txt.append(f"  Min:  {ser.min():.3f}")
-            txt.append(f"  Max:  {ser.max():.3f}")
+            txt.append(f"  Mean: {ser.mean():.3f}, Min: {ser.min():.3f}, Max: {ser.max():.3f}")
     return "\n".join(txt)
-
 
 def cli_fetch_and_print(args):
     # 1. Resolve Location
@@ -212,7 +227,7 @@ def cli_fetch_and_print(args):
         latlon = geocode_place(args.place)
     
     if latlon is None:
-        print("Error: Could not determine location. Please provide --lat/--lon or a valid --place.")
+        print("Error: Could not determine location.")
         return 2
     lat, lon = latlon
     print(f"Using coordinates: Lat={lat:.3f}, Lon={lon:.3f}")
@@ -227,15 +242,14 @@ def cli_fetch_and_print(args):
             end_dt = datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
             print(f"Querying for month: {start_dt.strftime('%B %Y')}")
         except ValueError:
-            print("Error: Invalid --month-year format. Please use MM-YYYY (e.g., '08-2022').")
+            print("Error: Invalid --month-year format. Use MM-YYYY.")
             return 3
     else:
-        # Default to last 30 days
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=30)
         print("No time specified, defaulting to the last 30 days.")
 
-    # 3. Fetch Data using the Strategy
+    # 3. Fetch Data
     df = fetch_data_with_strategy(args.server, args.var_friendly, lat, lon, start_dt, end_dt)
 
     # 4. Print Summary
@@ -243,6 +257,178 @@ def cli_fetch_and_print(args):
     print(summarize_df(df))
     return 0
 
+# -------------------------
+# Streamlit and Flask helpers (NOW UPDATED)
+# -------------------------
+def erddap_streamlit_widget(server=ERDDAP_SERVER):
+    try:
+        import streamlit as st
+    except ImportError:
+        print("Streamlit not installed. Skipping Streamlit widget.")
+        return
+        
+    st.sidebar.header('Ocean Data Query')
+    var_choice = st.sidebar.selectbox('Variable', list(DATASET_STRATEGY.keys()))
+    place = st.sidebar.text_input('Place name (e.g., "Honolulu, Hawaii")')
+    manual_latlon = st.sidebar.text_input('Or manual lat,lon (e.g. "21.3,-157.8")')
+    month_year = st.sidebar.text_input('Month-Year (MM-YYYY, optional)', placeholder="e.g., 08-2022")
+    server_input = st.sidebar.text_input('ERDDAP server', value=server)
+    
+    if st.sidebar.button('Fetch Data'):
+        # 1. Resolve Location
+        latlon = None
+        if manual_latlon:
+            try:
+                parts = [p.strip() for p in manual_latlon.split(',')]
+                latlon = (float(parts[0]), float(parts[1]))
+            except (ValueError, IndexError):
+                st.error('Invalid lat,lon format.')
+                return
+        elif place:
+            with st.spinner('Geocoding place...'):
+                latlon = geocode_place(place)
+                if not latlon:
+                    st.error('Geocoding failed.')
+                    return
+        else:
+            st.warning('Please enter a place or lat,lon.')
+            return
+        
+        lat, lon = latlon
+        
+        # 2. Resolve Time
+        if month_year:
+            try:
+                m, y = map(int, month_year.split('-'))
+                _, last_day = calendar.monthrange(y, m)
+                start_dt = datetime(y, m, 1, tzinfo=timezone.utc)
+                end_dt = datetime(y, m, last_day, 23, 59, 59, tzinfo=timezone.utc)
+            except ValueError:
+                st.error("Invalid Month-Year format. Use MM-YYYY.")
+                return
+        else:
+            end_dt = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(days=30)
+            st.info("No date specified. Fetching last 30 days.")
+            
+        # 3. Fetch Data
+        st.write(f"Fetching {var_choice} data for {lat:.2f}, {lon:.2f}...")
+        with st.spinner('Querying ERDDAP...'):
+            result = fetch_data_with_strategy(server_input, var_choice, lat, lon, start_dt, end_dt, debug=True)
+            df, raw_texts, ds_id, var_name = result
+        
+        st.write(f"**Dataset Used:** `{ds_id}`")
+        
+        if df.empty:
+            st.error('No data returned for this query.')
+            with st.expander("Show debug info"):
+                for i, (u, t) in enumerate(raw_texts):
+                    st.markdown(f"**Attempt {i+1} URL:** `{u}`")
+                    st.code(t)
+            return
+        
+        # 4. Display results
+        st.subheader('Timeseries Plot')
+        st.plotly_chart(timeseries_plot(df), use_container_width=True)
+        
+        st.subheader('Latest Data Point on Map')
+        st.plotly_chart(map_scatter_plot(df), use_container_width=True)
+
+        st.subheader('Data Summary')
+        st.text(summarize_df(df))
+
+def register_erddap_blueprint(app, server=ERDDAP_SERVER):
+    try:
+        from flask import Blueprint, request, render_template_string
+    except ImportError:
+        print("Flask not installed. Skipping Flask blueprint registration.")
+        return
+        
+    bp = Blueprint('erddap_integration', __name__)
+    FORM_HTML = """
+    <!doctype html><html><head><title>ERDDAP Query</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>body{font-family:sans-serif;padding:2em;}</style></head><body>
+    <h3>ERDDAP Data Fetcher</h3>
+    <form method="post">
+      Variable: <select name="variable">
+      {% for v in variables %}<option value="{{v}}" {% if v == selected_var %}selected{% endif %}>{{v}}</option>{% endfor %}
+      </select><br>
+      Place name: <input name="place" value="{{place}}" placeholder="e.g. Mumbai, India"><br>
+      Or lat,lon: <input name="latlon" value="{{latlon}}" placeholder="21.3,-157.8"><br>
+      Month-Year (MM-YYYY, optional): <input name="month_year" value="{{month_year}}" placeholder="e.g. 08-2022"><br>
+      <button type="submit">Fetch</button>
+    </form>
+    <div id="info">{{info|safe}}</div>
+    <div id="charts">{{charts|safe}}</div>
+    </body></html>
+    """
+    @bp.route('/erddap', methods=['GET', 'POST'])
+    def erddap_form():
+        info_html = ''
+        charts_html = ''
+        form_data = {
+            'variables': list(DATASET_STRATEGY.keys()),
+            'selected_var': 'Temperature',
+            'place': '', 'latlon': '', 'month_year': ''
+        }
+
+        if request.method == 'POST':
+            var_choice = request.form.get('variable')
+            place = request.form.get('place','').strip()
+            manual_latlon = request.form.get('latlon','').strip()
+            month_year = request.form.get('month_year', '').strip()
+
+            form_data.update({'selected_var': var_choice, 'place': place, 'latlon': manual_latlon, 'month_year': month_year})
+
+            # 1. Resolve Location
+            latlon = None
+            if manual_latlon:
+                try:
+                    p = [x.strip() for x in manual_latlon.split(',')]
+                    latlon = (float(p[0]), float(p[1]))
+                except (ValueError, IndexError):
+                    info_html = '<p style="color:red;">Error: Invalid lat,lon format.</p>'
+                    return render_template_string(FORM_HTML, **form_data, info=info_html)
+            elif place:
+                latlon = geocode_place(place)
+                if not latlon:
+                    info_html = '<p style="color:red;">Error: Geocoding failed.</p>'
+                    return render_template_string(FORM_HTML, **form_data, info=info_html)
+            
+            if not latlon:
+                info_html = '<p style="color:orange;">Please provide a place or lat,lon.</p>'
+                return render_template_string(FORM_HTML, **form_data, info=info_html)
+            
+            lat, lon = latlon
+            
+            # 2. Resolve Time
+            if month_year:
+                try:
+                    m, y = map(int, month_year.split('-'))
+                    _, last_day = calendar.monthrange(y, m)
+                    start_dt = datetime(y, m, 1, tzinfo=timezone.utc)
+                    end_dt = datetime(y, m, last_day, 23, 59, 59, tzinfo=timezone.utc)
+                except ValueError:
+                    info_html = '<p style="color:red;">Error: Invalid Month-Year. Use MM-YYYY.</p>'
+                    return render_template_string(FORM_HTML, **form_data, info=info_html)
+            else:
+                end_dt = datetime.now(timezone.utc)
+                start_dt = end_dt - timedelta(days=30)
+            
+            # 3. Fetch Data
+            df = fetch_data_with_strategy(server, var_choice, lat, lon, start_dt, end_dt)
+            
+            if df.empty:
+                info_html = '<p style="color:red;">No data returned for this query.</p>'
+            else:
+                fig_ts = timeseries_plot(df)
+                fig_map = map_scatter_plot(df)
+                charts_html = f"<script>Plotly.newPlot('charts', {fig_ts.to_json()});</script>"
+        
+        return render_template_string(FORM_HTML, **form_data, info=info_html, charts=charts_html)
+
+    app.register_blueprint(bp)
 
 # -------------------------
 # CLI entrypoint
@@ -250,37 +436,26 @@ def cli_fetch_and_print(args):
 def build_argparser():
     p = argparse.ArgumentParser(
         prog="erddap_integration.py",
-        description="Fetch timeseries from ERDDAP. Automatically switches between historical and NRT datasets."
+        description="Fetch timeseries from ERDDAP, auto-switching datasets."
     )
-    p.add_argument("--server", default=ERDDAP_SERVER, help="ERDDAP server base URL")
-    
-    # Location arguments
+    p.add_argument("--server", default=ERDDAP_SERVER, help="ERDDAP server URL")
     loc_group = p.add_mutually_exclusive_group(required=True)
     loc_group.add_argument("--place", type=str, help="Place name (e.g., 'Honolulu, Hawaii')")
     loc_group.add_argument("--latlon", type=str, help="Manual lat,lon (e.g., '21.3,-157.8')")
-
-    # Time arguments
-    p.add_argument("--month-year", type=str, help="Fetch data for a specific month and year (format: MM-YYYY)")
-    
-    p.add_argument(
-        "--var-friendly", 
-        choices=DATASET_STRATEGY.keys(), 
-        default="Temperature",
-        help="Friendly variable name to query."
-    )
+    p.add_argument("--month-year", type=str, help="Fetch for a specific month (format: MM-YYYY)")
+    p.add_argument("--var-friendly", choices=DATASET_STRATEGY.keys(), default="Temperature", help="Friendly variable name.")
     return p
 
 def main():
     parser = build_argparser()
     args = parser.parse_args()
 
-    # Post-process latlon argument if provided
     if args.latlon:
         try:
             lat_str, lon_str = args.latlon.split(',')
             args.lat, args.lon = float(lat_str), float(lon_str)
         except ValueError:
-            print("Error: Invalid --latlon format. Please use 'lat,lon' (e.g., '21.3,-157.8').")
+            print("Error: Invalid --latlon format. Use 'lat,lon'.")
             sys.exit(1)
     else:
         args.lat, args.lon = None, None
@@ -289,8 +464,9 @@ def main():
         rc = cli_fetch_and_print(args)
         sys.exit(rc)
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        print("\nInterrupted.")
         sys.exit(130)
 
 if __name__ == "__main__":
     main()
+
