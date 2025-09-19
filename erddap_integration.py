@@ -136,59 +136,68 @@ def geocode_place(place):
 # -------------------------
 # Helper: fetch gridded point timeseries
 # -------------------------
-def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_date=None, days=7, debug=False):
+def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_date=None, days=7, start_year=None, end_year=None, debug=False):
     """
-    Robust fetch: try progressively larger bbox and longer days window if no data.
-    Returns DataFrame (possibly empty). If debug=True returns tuple (df, raw_texts) where raw_texts
-    is list of (url, text) pairs captured during attempts.
+    Robust fetch supporting either day-window (legacy) or year-range (preferred).
+    - If start_year and end_year are provided, uses Jan 1 start_year -> Dec 31 end_year.
+    - Otherwise uses 'days' back from end_date (legacy behaviour).
+    Returns a DataFrame or (DataFrame, raw_texts) when debug=True.
     """
     raw_texts = []
-    if end_date is None:
-        end_date = datetime.utcnow().date()
-    if isinstance(end_date, datetime):
-        end_date = end_date.date()
+    # Determine date window
+    if start_year is not None and end_year is not None:
+        # Use full-year coverage
+        start_date = datetime(int(start_year), 1, 1).date()
+        end_date_obj = datetime(int(end_year), 12, 31).date()
+    else:
+        if end_date is None:
+            end_date_obj = datetime.utcnow().date()
+        elif isinstance(end_date, datetime):
+            end_date_obj = end_date.date()
+        else:
+            end_date_obj = end_date
+        start_date = end_date_obj - timedelta(days=days-1)
 
-    attempt_bboxes = [BBOX_HALF_DEG, 0.25, 0.5, 1.0]  # degrees half-width to try
-    attempt_days = [days, min(30, max(days, 7)), min(90, max(days, 30))]
+    # Convert to ISO strings
+    start = start_date.isoformat()
+    end = end_date_obj.isoformat()
 
-    for d in attempt_days:
-        start_date = end_date - timedelta(days=d-1)
-        start = start_date.isoformat()
-        end = end_date.isoformat()
-        for hb in attempt_bboxes:
-            lat_min = lat - hb
-            lat_max = lat + hb
-            lon_min = lon - hb
-            lon_max = lon + hb
-            url = (
-                f"{server}/griddap/{dataset_id}.csv?{variable}"
-                f"[({start}):1:({end})]"
-                f"[({lat_min}):1:({lat_max})]"
-                f"[({lon_min}):1:({lon_max})]"
-            )
-            try:
-                r = requests.get(url, timeout=60)
-                # capture raw text for debug
-                raw_texts.append((url, r.text[:50000]))  # cap stored text length
-                if r.status_code != 200:
-                    # try next attempt
-                    continue
-                df = pd.read_csv(io.StringIO(r.text))
-                if 'time' in df.columns:
-                    df['time'] = pd.to_datetime(df['time'])
-                # If dataframe has rows, return immediately
-                if not df.empty:
-                    if debug:
-                        return df, raw_texts
-                    return df
-            except Exception as e:
-                raw_texts.append((url, f"EXCEPTION: {e}"))
+    # Try multiple bbox sizes if single bbox returns empty (progressively larger)
+    attempt_bboxes = [BBOX_HALF_DEG, 0.25, 0.5, 1.0, 2.0]  # half-width degrees to try
+    # Try the base single URL first, then progressively larger searches
+    for hb in attempt_bboxes:
+        lat_min = lat - hb
+        lat_max = lat + hb
+        lon_min = lon - hb
+        lon_max = lon + hb
+        url = (
+            f"{server}/griddap/{dataset_id}.csv?{variable}"
+            f"[({start}):1:({end})]"
+            f"[({lat_min}):1:({lat_max})]"
+            f"[({lon_min}):1:({lon_max})]"
+        )
+        try:
+            r = requests.get(url, timeout=90)
+            raw_texts.append((url, r.text[:50000]))
+            if r.status_code != 200:
+                # Continue to next bbox if server error or not found
                 continue
+            df = pd.read_csv(io.StringIO(r.text))
+            if 'time' in df.columns:
+                df['time'] = pd.to_datetime(df['time'])
+            if not df.empty:
+                if debug:
+                    return df, raw_texts
+                return df
+        except Exception as e:
+            raw_texts.append((url, f"EXCEPTION: {e}"))
+            continue
 
-    # Last resort: return empty df, but include raw_texts when debug=True
+    # If we reached here, no data found in any bbox attempt
     if debug:
         return pd.DataFrame(), raw_texts
     return pd.DataFrame()
+
 
 
 
@@ -307,7 +316,10 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
     var_choice = st.sidebar.selectbox('Variable', list(DEFAULT_VARIABLES.keys()))
     place = st.sidebar.text_input('Place name (or leave blank to enter lat,lon manually)')
     manual_latlon = st.sidebar.text_input('Manual lat,lon (e.g. "20.5,70.2")')
-    days = st.sidebar.slider('Days for timeseries', min_value=1, max_value=30, value=7)
+    # Year-range selector (replaces days slider)
+    current_year = datetime.utcnow().year
+    year_range = st.sidebar.slider('Year range', min_value=1980, max_value=current_year, value=(current_year-1, current_year), step=1)
+    start_year, end_year = year_range
     server_input = st.sidebar.text_input('ERDDAP server', value=server)
 
     if st.sidebar.button('Fetch'):
@@ -335,21 +347,44 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
             st.stop()
 
         lat, lon = latlon
+
+        # Optional manual overrides for dataset & var (very useful when auto-pick fails)
+        st.markdown("**Optional overrides (use if automatic discovery returns no data):**")
+        manual_dataset = st.text_input('Override dataset_id (leave blank to use auto-discovery)')
+        manual_var = st.text_input('Override variable name (leave blank to use auto-detected var)')
+
         with st.spinner('Discovering dataset...'):
-            dataset_id, varname = pick_dataset_and_var(server_input, var_choice)
+            if manual_dataset.strip():
+                dataset_id = manual_dataset.strip()
+                if manual_var.strip():
+                    varname = manual_var.strip()
+                else:
+                    _, varname = pick_dataset_and_var(server_input, var_choice)
+                    if varname is None:
+                        varname = DEFAULT_VARIABLES[var_choice]['var_names'][0]
+            else:
+                dataset_id, varname = pick_dataset_and_var(server_input, var_choice)
+
         if dataset_id is None:
-            st.error('Could not find a suitable dataset on ERDDAP. Try another variable or specify dataset manually.')
-            dataset_id = st.text_input('dataset_id (enter a griddap dataset ID if you know one)')
-            varname = st.text_input('variable name in dataset (e.g. sst, sss)')
-            if not dataset_id or not varname:
-                return
+            st.error('Could not find a suitable dataset on ERDDAP. Please enter dataset_id and variable manually.')
+            return
 
         st.write(f"Using dataset: **{dataset_id}** and variable **{varname}**")
 
-        with st.spinner('Fetching timeseries...'):
-            df = fetch_griddap_point_timeseries(server_input, dataset_id, varname, lat, lon, days=days)
+        with st.spinner('Fetching timeseries for years %d - %d (may try larger bbox)...' % (start_year, end_year)):
+            result = fetch_griddap_point_timeseries(server_input, dataset_id, varname, lat, lon, start_year=start_year, end_year=end_year, debug=True)
+            if isinstance(result, tuple):
+                df, raw_texts = result
+            else:
+                df = result
+                raw_texts = []
+
         if df.empty:
-            st.error('No data returned for that dataset/variable/point/time. Try a different dataset or date range.')
+            st.error('No data returned for that dataset/variable/point/time. Showing debug info below.')
+            for i, (u, t) in enumerate(raw_texts[:8]):
+                st.markdown(f"**Attempt {i+1}**: `{u}`")
+                st.code(t[:4000])
+            st.info('Try entering a different dataset_id, a different variable name (e.g. sst, sss), a nearby lat/lon, or expand the year range.')
             return
 
         st.subheader('Timeseries')
