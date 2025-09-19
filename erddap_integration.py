@@ -136,44 +136,60 @@ def geocode_place(place):
 # -------------------------
 # Helper: fetch gridded point timeseries
 # -------------------------
-def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_date=None, days=7):
+def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_date=None, days=7, debug=False):
     """
-    Fetch small time-series for the nearest grid cell around (lat,lon) for variable.
-    Returns pandas.DataFrame with columns time, latitude, longitude, <variable>
+    Robust fetch: try progressively larger bbox and longer days window if no data.
+    Returns DataFrame (possibly empty). If debug=True returns tuple (df, raw_texts) where raw_texts
+    is list of (url, text) pairs captured during attempts.
     """
+    raw_texts = []
     if end_date is None:
         end_date = datetime.utcnow().date()
     if isinstance(end_date, datetime):
         end_date = end_date.date()
-    start_date = end_date - timedelta(days=days-1)
 
-    lat_min = lat - BBOX_HALF_DEG
-    lat_max = lat + BBOX_HALF_DEG
-    lon_min = lon - BBOX_HALF_DEG
-    lon_max = lon + BBOX_HALF_DEG
+    attempt_bboxes = [BBOX_HALF_DEG, 0.25, 0.5, 1.0]  # degrees half-width to try
+    attempt_days = [days, min(30, max(days, 7)), min(90, max(days, 30))]
 
-    # ERDDAP griddap CSV syntax
-    # e.g. /griddap/<datasetID>.csv?<var>[(start):1:(end)][(latmin):1:(latmax)][(lonmin):1:(lonmax)]
-    start = start_date.isoformat()
-    end = end_date.isoformat()
-    var_part = variable
-    url = (
-        f"{server}/griddap/{dataset_id}.csv?{var_part}"
-        f"[({start}):1:({end})]"
-        f"[({lat_min}):1:({lat_max})]"
-        f"[({lon_min}):1:({lon_max})]"
-    )
-    try:
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        # Convert time to datetime if present
-        if 'time' in df.columns:
-            df['time'] = pd.to_datetime(df['time'])
-        return df
-    except Exception as e:
-        print('fetch_griddap_point_timeseries error', e)
-        return pd.DataFrame()
+    for d in attempt_days:
+        start_date = end_date - timedelta(days=d-1)
+        start = start_date.isoformat()
+        end = end_date.isoformat()
+        for hb in attempt_bboxes:
+            lat_min = lat - hb
+            lat_max = lat + hb
+            lon_min = lon - hb
+            lon_max = lon + hb
+            url = (
+                f"{server}/griddap/{dataset_id}.csv?{variable}"
+                f"[({start}):1:({end})]"
+                f"[({lat_min}):1:({lat_max})]"
+                f"[({lon_min}):1:({lon_max})]"
+            )
+            try:
+                r = requests.get(url, timeout=60)
+                # capture raw text for debug
+                raw_texts.append((url, r.text[:50000]))  # cap stored text length
+                if r.status_code != 200:
+                    # try next attempt
+                    continue
+                df = pd.read_csv(io.StringIO(r.text))
+                if 'time' in df.columns:
+                    df['time'] = pd.to_datetime(df['time'])
+                # If dataframe has rows, return immediately
+                if not df.empty:
+                    if debug:
+                        return df, raw_texts
+                    return df
+            except Exception as e:
+                raw_texts.append((url, f"EXCEPTION: {e}"))
+                continue
+
+    # Last resort: return empty df, but include raw_texts when debug=True
+    if debug:
+        return pd.DataFrame(), raw_texts
+    return pd.DataFrame()
+
 
 
 # -------------------------
