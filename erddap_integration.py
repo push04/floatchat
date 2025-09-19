@@ -12,35 +12,23 @@ INSTRUCTIONS (paste these lines into your repo):
    And then inside your main UI rendering function (where the Streamlit widgets live), add a single call:
    erddap_streamlit_widget()
 
-   That is the only modification required in app.py for Streamlit integration.
-
 3b) If your app is a Flask (or other WSGI) app: add these two lines near app initialization:
    from erddap_integration import register_erddap_blueprint
    register_erddap_blueprint(app)
 
-   This will mount a small blueprint at /erddap which provides a form, results and Plotly charts.
-
 IMPORTANT: This module only *adds* new functions/routes/UI. It does not modify any of your existing functions.
-
-USAGE:
-- Streamlit: the widget will show an options select for variables (temperature, salinity, chlorophyll), a place text box (or manual lat/lon), timeframe, and render interactive Plotly charts.
-- Flask: visit /erddap, submit the form and see charts.
-
-Notes on behavior:
-- The code auto-discovers ERDDAP datasets by keyword using the ERDDAP search endpoint. It will try to choose a dataset containing the requested variable. If discovery fails, you'll be prompted to specify a dataset_id.
-- For geocoding a place name we use Nominatim (geopy). If not available or rate-limited, use the "Manual lat,lon" text input.
-
 """
 
 from datetime import datetime, timedelta
 import math
 import io
+import re
 import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Optional geocoding (install geopy). If not installed, the code will prompt manual lat/lon input.
+# Optional geocoding (install geopy). If not installed, we fall back to Nominatim HTTP.
 try:
     from geopy.geocoders import Nominatim
     GEOPY_AVAILABLE = True
@@ -53,54 +41,104 @@ BBOX_HALF_DEG = 0.125
 
 
 # -------------------------
+# Utils
+# -------------------------
+def _normalize_colname(s: str) -> str:
+    """Normalize column names to compare easily (remove non-alphanum, lower)."""
+    return re.sub(r'\W+', '', str(s)).lower()
+
+
+# -------------------------
 # Helper: discover datasets
 # -------------------------
-
 def discover_erddap_datasets(server=ERDDAP_SERVER, keyword="sst", max_results=8):
-    """Search ERDDAP server for datasets matching keyword.
-
-    Returns a pandas.DataFrame with columns: datasetID, title, variables (if available)
+    """
+    Search ERDDAP server for datasets matching keyword.
+    Returns a pandas.DataFrame standardized to have columns: dataset_id, title (if available).
+    Falls back to returning the raw DataFrame if parsing fails.
     """
     try:
         q = requests.utils.requote_uri(f"{server}/search/index.csv?searchFor={keyword}&itemsPerPage={max_results}")
         r = requests.get(q, timeout=30)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
-        # The ERDDAP search returns columns: datasetID, title, id, ... keep datasetID + title
-        if 'datasetID' in df.columns:
-            return df[['datasetID', 'title']].drop_duplicates().reset_index(drop=True)
-        # fallback
+
+        # Normalize column names and look for dataset-id like columns
+        col_map = { _normalize_colname(c): c for c in df.columns }
+        # candidates that indicate dataset id
+        candidates = ['datasetid', 'dataset_id', 'dataset', 'datasetid', 'datasetid']
+        dataset_col = None
+        for cand in candidates:
+            if cand in col_map:
+                dataset_col = col_map[cand]
+                break
+        # title column candidates
+        title_col = None
+        for cand in ['title', 'datasettitle', 'titletext']:
+            if cand in col_map:
+                title_col = col_map[cand]
+                break
+
+        if dataset_col:
+            # create standardized columns
+            df = df.copy()
+            df.rename(columns={dataset_col: 'dataset_id'}, inplace=True)
+            if title_col:
+                df.rename(columns={title_col: 'title'}, inplace=True)
+                return df[['dataset_id', 'title']].drop_duplicates().reset_index(drop=True)
+            return df[['dataset_id']].drop_duplicates().reset_index(drop=True)
+
+        # If we couldn't find a dataset id column, return raw df (caller will handle empty case)
         return df
+
     except Exception as e:
         print("ERDDAP discover failed:", e)
         return pd.DataFrame()
 
 
 # -------------------------
-# Helper: basic geocode
+# Helper: basic geocode (geopy optional, otherwise HTTP Nominatim)
 # -------------------------
-
 def geocode_place(place):
-    """Return (lat, lon) from place name using Nominatim (geopy). Returns None on failure."""
-    if not GEOPY_AVAILABLE:
-        return None
+    """
+    Return (lat, lon) from place name.
+    Uses geopy.Nominatim if installed; otherwise falls back to OpenStreetMap Nominatim HTTP.
+    Returns None on failure.
+    """
+    # Try geopy first
+    if GEOPY_AVAILABLE:
+        try:
+            geolocator = Nominatim(user_agent="floatchat_erddap_integration")
+            loc = geolocator.geocode(place, timeout=10)
+            if loc:
+                return float(loc.latitude), float(loc.longitude)
+        except Exception as e:
+            print("Geopy geocode failed:", e)
+
+    # Fallback: HTTP Nominatim
     try:
-        geolocator = Nominatim(user_agent="floatchat_erddap_integration")
-        loc = geolocator.geocode(place, timeout=10)
-        if loc:
-            return float(loc.latitude), float(loc.longitude)
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": place, "format": "json", "limit": 1, "addressdetails": 0}
+        headers = {"User-Agent": "floatchat_erddap_integration/1.0 (your_email@example.com)"}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        if isinstance(j, list) and len(j) > 0:
+            lat = float(j[0].get("lat"))
+            lon = float(j[0].get("lon"))
+            return lat, lon
     except Exception as e:
-        print("Geocode failed:", e)
+        print("Geocode failed (nominatim):", e)
+
     return None
 
 
 # -------------------------
 # Helper: fetch gridded point timeseries
 # -------------------------
-
 def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_date=None, days=7):
-    """Fetch small time-series for the nearest grid cell around (lat,lon) for variable.
-
+    """
+    Fetch small time-series for the nearest grid cell around (lat,lon) for variable.
     Returns pandas.DataFrame with columns time, latitude, longitude, <variable>
     """
     if end_date is None:
@@ -129,8 +167,7 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
         r = requests.get(url, timeout=60)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
-        # ERDDAP CSV usually repeats header rows; keep first header row parse
-        # Convert time to datetime
+        # Convert time to datetime if present
         if 'time' in df.columns:
             df['time'] = pd.to_datetime(df['time'])
         return df
@@ -142,7 +179,6 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
 # -------------------------
 # Helper: choose dataset & variable mapping
 # -------------------------
-
 # Friendly variable -> search keywords and common variable names to try
 DEFAULT_VARIABLES = {
     'Temperature': {'search_kw': 'sst OR sea surface temperature OR sea_surface_temperature', 'var_names': ['sst', 'analysed_sst', 'sea_surface_temperature', 'temperature']},
@@ -152,33 +188,43 @@ DEFAULT_VARIABLES = {
 
 
 def pick_dataset_and_var(server, friendly_variable):
-    """Try to discover a dataset and a plausible variable name for the friendly_variable.
-
+    """
+    Try to discover a dataset and a plausible variable name for the friendly_variable.
     Returns (dataset_id, variable_name) or (None, None).
     """
     if friendly_variable not in DEFAULT_VARIABLES:
         return None, None
     info = DEFAULT_VARIABLES[friendly_variable]
+
     # search by keywords; if search fails try shorter keyword
     df = discover_erddap_datasets(server, info['search_kw'])
     if df.empty:
-        # try single word
         df = discover_erddap_datasets(server, friendly_variable.lower())
     if df.empty:
         return None, None
-    # pick first dataset
-    dataset_id = df.iloc[0]['datasetID']
+
+    # If the discovery returned a DataFrame with a dataset_id column, pick the first row
+    if 'dataset_id' in df.columns:
+        dataset_id = df.iloc[0]['dataset_id']
+    else:
+        # fallback: try common columns in the returned DF
+        possible_cols = [c for c in df.columns if 'dataset' in c.lower()]
+        dataset_id = df.iloc[0][possible_cols[0]] if possible_cols else None
+
+    if not dataset_id:
+        return None, None
+
     # choose a variable name from candidates
-    # Note: we can't inspect dataset variables easily without opening its dataset page. We'll try candidates.
     for v in info['var_names']:
-        # Quick test: try fetching just 1 day at lat=0 lon=0 with a tiny bbox - if no error, likely works.
-        test_url = f"{server}/griddap/{dataset_id}.csv?{v}[(1970-01-01T00:00:00Z):1:(1970-01-01T00:00:00Z)][(0):1:(0)][(0):1:(0)]"
+        # Quick test: try fetching a tiny slice (1970-01-01) to detect if the variable exists
         try:
+            test_url = f"{server}/griddap/{dataset_id}.csv?{v}[(1970-01-01T00:00:00Z):1:(1970-01-01T00:00:00Z)][(0):1:(0)][(0):1:(0)]"
             r = requests.get(test_url, timeout=10)
             if r.status_code == 200 and len(r.text) > 0:
                 return dataset_id, v
         except Exception:
             continue
+
     # fallback: return dataset and first candidate (user may need to edit)
     return dataset_id, info['var_names'][0]
 
@@ -186,7 +232,6 @@ def pick_dataset_and_var(server, friendly_variable):
 # -------------------------
 # Plot helpers
 # -------------------------
-
 def timeseries_plot(df, variable):
     """Create a Plotly figure for a small timeseries DataFrame."""
     if df.empty:
@@ -230,7 +275,6 @@ def map_scatter_plot(df, variable):
 # -------------------------
 # Streamlit widget (drop-in)
 # -------------------------
-
 def erddap_streamlit_widget(server=ERDDAP_SERVER):
     """If your app is Streamlit, call this function in your main UI to mount the ERDDAP widget.
 
@@ -264,7 +308,7 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
             with st.spinner('Geocoding place...'):
                 g = geocode_place(place)
                 if g is None:
-                    st.warning('Geocoding failed or geopy not installed. Please enter manual lat,lon.')
+                    st.warning('Geocoding failed or not available. Please enter manual lat,lon.')
                 else:
                     latlon = g
         else:
@@ -314,7 +358,6 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
 # -------------------------
 # Flask blueprint (optional)
 # -------------------------
-
 def register_erddap_blueprint(app, server=ERDDAP_SERVER):
     """Register a small Flask blueprint at /erddap for interactive queries.
 
@@ -410,4 +453,3 @@ if __name__ == '__main__':
     # quick smoke test: discover SST datasets
     print('Discovering SST datasets...')
     print(discover_erddap_datasets())
-
