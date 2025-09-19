@@ -36,6 +36,9 @@ import os
 
 
 import streamlit.components.v1 as components
+# ERDDAP widget (paste after your other imports)
+from erddap_integration import erddap_streamlit_widget
+
 
 """
 ERDDAP integration helper for floatchat/app.py
@@ -842,6 +845,9 @@ st.markdown(
     and biogeochemical variables — no complex tools required.
     """
 )
+
+# inside your main UI function (after st.set_page_config or st.title etc.)
+erddap_streamlit_widget()
 
 
 st.markdown(
