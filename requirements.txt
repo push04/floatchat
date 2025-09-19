@@ -11,3 +11,4 @@ xarray
 netcdf4
 dask
 motuclient
+geopy
