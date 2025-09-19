@@ -23,8 +23,12 @@ BBOX_HALF_DEG = 0.125
 
 
 # -------------------------
-# Dataset info / time-range extraction
+# Small helpers
 # -------------------------
+def _normalize_colname(s: str) -> str:
+    return re.sub(r'\W+', '', str(s)).lower()
+
+
 def _parse_iso_z(s):
     """Parse ISO timestamp possibly ending with Z into a timezone-aware datetime in UTC."""
     try:
@@ -33,104 +37,193 @@ def _parse_iso_z(s):
         return datetime.fromisoformat(s).astimezone(timezone.utc)
     except Exception:
         try:
-            # sometimes strings appear without time part
             return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
         except Exception:
             return None
 
 
-def get_dataset_time_range(server, dataset_id, timeout=8):
+# -------------------------
+# Dataset variables + discovery
+# -------------------------
+def get_dataset_variables(server, dataset_id, timeout=8):
     """
-    Try to determine a dataset's time axis minimum and maximum.
-    Returns (min_dt, max_dt) as timezone-aware datetimes in UTC, or (None, None) if unknown.
-    Strategy:
-      1) Read /info/{dataset}/index.csv and look for time variable attribute rows (actual_range, time_coverage_start/end, valid_range, or similar).
-      2) If CSV parsing fails or no info, attempt a probe griddap request with a wide time window to elicit a 404 message that contains the axis minimum/maximum.
+    Read dataset index.csv to get variable names. Returns list or empty list.
+    Silent on failures.
     """
-    # 1) Try index.csv parsing
     try:
         url = f"{server}/info/{dataset_id}/index.csv"
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text), dtype=str)
-        # Normalized column names commonly present: 'Variable Name', 'Attribute Name', 'Value'
-        cols_norm = {c.lower(): c for c in df.columns}
-        # If the CSV has 'Variable Name' and 'Attribute Name' and 'Value', use them
-        var_col = None
-        attr_col = None
-        val_col = None
-        for k, v in cols_norm.items():
-            if 'variable' in k and 'name' in k:
-                var_col = v
-            if 'attribute' in k and 'name' in k:
-                attr_col = v
-            if 'value' in k:
-                val_col = v
-        # Also some servers use 'destinationName' etc. We'll try to interpret rows where variable contains 'time'
-        if var_col and attr_col and val_col:
-            # find rows for time variable (variable name == 'time' or contains 'time')
-            rows = df[df[var_col].astype(str).str.lower().str.contains(r'\btime\b', na=False)]
-            # also look for global attributes (variable blank) with time_coverage_start/end
-            global_rows = df[df[var_col].isna() | (df[var_col].astype(str).str.strip() == '')]
-            # Try to find time coverage start/end
+        # find a column that looks like 'Variable Name' or 'destinationName'
+        cols = [c for c in df.columns if 'variable' in c.lower() and 'name' in c.lower()]
+        if not cols:
+            cols = [c for c in df.columns if 'destination' in c.lower() or 'destinationname' in c.lower()]
+        if not cols:
+            # fallback: sometimes index.csv lists a 'Row Type' column with variable rows
+            if 'Row Type' in df.columns:
+                vars_df = df[df['Row Type'].astype(str).str.lower() == 'variable']
+                if 'Variable Name' in vars_df.columns:
+                    return vars_df['Variable Name'].dropna().astype(str).unique().tolist()
+            return []
+        var_col = cols[0]
+        vars_list = df[var_col].dropna().astype(str).unique().tolist()
+        return [v.strip() for v in vars_list if v.strip()]
+    except Exception:
+        return []
+
+
+def discover_erddap_datasets(server=ERDDAP_SERVER, keyword="sst", max_results=20):
+    """
+    Search ERDDAP server for datasets matching keyword.
+    Returns DataFrame with dataset_id (and title if available) or empty DataFrame.
+    """
+    try:
+        q = requests.utils.requote_uri(f"{server}/search/index.csv?searchFor={keyword}&itemsPerPage={max_results}")
+        r = requests.get(q, timeout=20)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        col_map = { _normalize_colname(c): c for c in df.columns }
+        candidates = ['datasetid', 'dataset_id', 'dataset', 'datasetname']
+        dataset_col = None
+        for cand in candidates:
+            if cand in col_map:
+                dataset_col = col_map[cand]
+                break
+        title_col = None
+        for cand in ['title', 'datasettitle', 'titletext']:
+            if cand in col_map:
+                title_col = col_map[cand]
+                break
+        if dataset_col:
+            df = df.copy()
+            df.rename(columns={dataset_col: 'dataset_id'}, inplace=True)
+            if title_col:
+                df.rename(columns={title_col: 'title'}, inplace=True)
+                return df[['dataset_id', 'title']].drop_duplicates().reset_index(drop=True)
+            return df[['dataset_id']].drop_duplicates().reset_index(drop=True)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+# -------------------------
+# Geocode helper
+# -------------------------
+def geocode_place(place):
+    """Return (lat, lon) from place name. Returns None on failure."""
+    if GEOPY_AVAILABLE:
+        try:
+            geolocator = Nominatim(user_agent="floatchat_erddap_integration")
+            loc = geolocator.geocode(place, timeout=10)
+            if loc:
+                return float(loc.latitude), float(loc.longitude)
+        except Exception:
+            pass
+    try:
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": place, "format": "json", "limit": 1, "addressdetails": 0}
+        headers = {"User-Agent": "floatchat_erddap_integration/1.0 (contact@example.com)"}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        if isinstance(j, list) and len(j) > 0:
+            return float(j[0].get("lat")), float(j[0].get("lon"))
+    except Exception:
+        pass
+    return None
+
+
+# -------------------------
+# Dataset time-range extraction
+# -------------------------
+def get_dataset_time_range(server, dataset_id, timeout=8):
+    """
+    Try to determine a dataset's time axis minimum and maximum.
+    Returns (min_dt, max_dt) as timezone-aware datetimes in UTC, or (None, None) if unknown.
+    Strategy:
+      - parse /info/{dataset}/index.csv for time attributes (actual_range, time_coverage_start/end)
+      - if not found, probe griddap with wide time window to elicit axis hints
+    """
+    # 1) parse index.csv
+    try:
+        url = f"{server}/info/{dataset_id}/index.csv"
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        txt = r.text
+        # Parse structured table if possible
+        try:
+            df = pd.read_csv(io.StringIO(txt), dtype=str)
+            cols_norm = {c.lower(): c for c in df.columns}
+            var_col = None
+            attr_col = None
+            val_col = None
+            for k, v in cols_norm.items():
+                if 'variable' in k and 'name' in k:
+                    var_col = v
+                if 'attribute' in k and 'name' in k:
+                    attr_col = v
+                if 'value' in k:
+                    val_col = v
             start = None
             end = None
-            # Check variable-specific attributes (e.g., actual_range)
-            for _, row in rows.iterrows():
-                attr = str(row[attr_col]).strip().lower()
-                val = str(row[val_col]).strip()
-                if 'actual_range' in attr or 'valid_range' in attr or 'actualrange' in attr:
-                    # often value like: [-1.2345, 2024-09-20T12:00:00Z] or "2024-09-20T12:00:00Z,2025-...". Try to extract datetimes
-                    found = re.findall(r"20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z", val)
-                    if len(found) >= 1 and start is None:
-                        start = _parse_iso_z(found[0])
-                    if len(found) >= 2 and end is None:
-                        end = _parse_iso_z(found[1])
-                    # fallback: find any ISO dates without T
-                    if (start is None or end is None):
+            if var_col and attr_col and val_col:
+                rows = df[df[var_col].astype(str).str.lower().str.contains(r'\btime\b', na=False)]
+                global_rows = df[df[var_col].isna() | (df[var_col].astype(str).str.strip() == '')]
+                for _, row in rows.iterrows():
+                    attr = str(row[attr_col]).strip().lower()
+                    val = str(row[val_col]).strip()
+                    if 'actual_range' in attr or 'valid_range' in attr or 'actualrange' in attr:
+                        found = re.findall(r"20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z", val)
+                        if len(found) >= 1 and start is None:
+                            start = _parse_iso_z(found[0])
+                        if len(found) >= 2 and end is None:
+                            end = _parse_iso_z(found[1])
                         found2 = re.findall(r"20[0-9]{2}-[01][0-9]-[0-3][0-9]", val)
                         if found2:
                             if start is None:
                                 start = _parse_iso_z(found2[0] + "T00:00:00Z")
                             if len(found2) >= 2 and end is None:
                                 end = _parse_iso_z(found2[1] + "T00:00:00Z")
-                if 'time_coverage_start' in attr or 'timecoverage_start' in attr:
-                    if start is None:
-                        start = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
-                if 'time_coverage_end' in attr or 'timecoverage_end' in attr:
-                    if end is None:
-                        end = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
-            # Check global attributes for time coverage
-            for _, row in global_rows.iterrows():
-                attr = str(row[attr_col]).strip().lower() if attr_col in row else ''
-                val = str(row[val_col]).strip() if val_col in row else ''
-                if 'time_coverage_start' in attr or 'timecoverage_start' in attr:
-                    if start is None:
-                        start = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
-                if 'time_coverage_end' in attr or 'timecoverage_end' in attr:
-                    if end is None:
-                        end = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
-            if start or end:
-                return start, end
-        # If we can't detect using the structured CSV, try to find any datetime-like strings in the CSV and pick min/max
-        all_text = r.text
-        found = re.findall(r"20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z", all_text)
-        if found:
-            dts = sorted({_parse_iso_z(x) for x in found if _parse_iso_z(x) is not None})
-            if dts:
-                return dts[0], dts[-1]
+                    if 'time_coverage_start' in attr or 'timecoverage_start' in attr:
+                        if start is None:
+                            start = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
+                    if 'time_coverage_end' in attr or 'timecoverage_end' in attr:
+                        if end is None:
+                            end = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
+                # check global rows
+                for _, row in global_rows.iterrows():
+                    try:
+                        attr = str(row[attr_col]).strip().lower()
+                        val = str(row[val_col]).strip()
+                    except Exception:
+                        continue
+                    if 'time_coverage_start' in attr or 'timecoverage_start' in attr:
+                        if start is None:
+                            start = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
+                    if 'time_coverage_end' in attr or 'timecoverage_end' in attr:
+                        if end is None:
+                            end = _parse_iso_z(val if 'T' in val else (val + "T00:00:00Z"))
+                if start or end:
+                    return start, end
+            # fallback: search text for ISO datetimes
+            found = re.findall(r"20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z", txt)
+            if found:
+                dts = sorted({_parse_iso_z(x) for x in found if _parse_iso_z(x) is not None})
+                if dts:
+                    return dts[0], dts[-1]
+        except Exception:
+            pass
     except Exception:
         pass
 
-    # 2) If index.csv failed or didn't contain time info, attempt to elicit axis hints by probing griddap with a very wide time range.
-    # We'll request a tiny spatial point but with time from 1900 -> now; ERDDAP often replies with 404 and a message containing axis minimum/maximum.
+    # 2) Probe griddap with a very wide time window to elicit axis hints (catch 404 text)
     try:
-        # pick a safe tiny point (lat=0 lon=0) - we won't use the returned data but the error message
         probe_url = f"{server}/griddap/{dataset_id}.csv?time[(1900-01-01T00:00:00Z):1:({(datetime.utcnow()+timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')})][(0):1:(0)][(0):1:(0)]"
         r = requests.get(probe_url, timeout=20)
         text = r.text if isinstance(r.text, str) else ''
-        # If server returned 200, try to parse the CSV for min/max time
         if r.status_code == 200:
+            # attempt to parse returned CSV for min/max times
             try:
                 df = pd.read_csv(io.StringIO(r.text))
                 if 'time' in [c.lower() for c in df.columns]:
@@ -144,17 +237,15 @@ def get_dataset_time_range(server, dataset_id, timeout=8):
                         return mn, mx
             except Exception:
                 pass
-        # If 404 or similar, try to extract axis min/max using regex
-        # Look for strings like "axis minimum=2024-09-20T12:00:00Z" or "axis maximum=2024-12-31T00:00:00Z"
+        # extract axis min/max from error message
         axis_min = None
         axis_max = None
-        mmin = re.search(r"axis ?minimum=([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)", text)
-        mmax = re.search(r"axis ?maximum=([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)", text)
+        mmin = re.search(r"axis ?minimum=([0-9T:\-]+Z)", text)
+        mmax = re.search(r"axis ?maximum=([0-9T:\-]+Z)", text)
         if mmin:
             axis_min = _parse_iso_z(mmin.group(1))
         if mmax:
             axis_max = _parse_iso_z(mmax.group(1))
-        # fallback looser regex
         if not axis_min or not axis_max:
             found = re.findall(r"(20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z)", text)
             if found:
@@ -190,19 +281,16 @@ def fetch_griddap_point_timeseries_using_dataset_time(server, dataset_id, variab
         end_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
         start_dt = end_dt - timedelta(days=30)
     elif start_dt is None and end_dt is not None:
-        # choose recent 30 days before end_dt
         end_dt = end_dt.astimezone(timezone.utc)
         start_dt = end_dt - timedelta(days=30)
     elif start_dt is not None and end_dt is None:
         start_dt = start_dt.astimezone(timezone.utc)
         end_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    # format ISO strings preserving time component if present, otherwise use date T00:00:00Z
     def _to_iso(dt):
         if dt is None:
             return None
         if isinstance(dt, datetime):
-            # ensure in UTC
             dt_utc = dt.astimezone(timezone.utc)
             return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         return str(dt)
@@ -210,7 +298,6 @@ def fetch_griddap_point_timeseries_using_dataset_time(server, dataset_id, variab
     start_iso = _to_iso(start_dt)
     end_iso = _to_iso(end_dt)
 
-    # build attempts: try exact point with lat-lon and lon-lat ordering
     orders = [("lat", "lon"), ("lon", "lat")]
     for order in orders:
         if order == ("lat", "lon"):
@@ -225,29 +312,9 @@ def fetch_griddap_point_timeseries_using_dataset_time(server, dataset_id, variab
             text = r.text if isinstance(r.text, str) else ''
             raw_texts.append((url, text[:60000] if text else f"HTTP {r.status_code}"))
             if r.status_code != 200:
-                # If 404, try to extract axis hints and retry once with clamped times (this is defensive)
-                if r.status_code == 404:
-                    # extract axis min/max and retry if they differ from start_iso/end_iso
-                    axis_min = None
-                    axis_max = None
-                    mmin = re.search(r"axis ?minimum=([0-9T:\-]+Z)", text)
-                    mmax = re.search(r"axis ?maximum=([0-9T:\-]+Z)", text)
-                    if mmin:
-                        axis_min = _parse_iso_z(mmin.group(1))
-                    if mmax:
-                        axis_max = _parse_iso_z(mmax.group(1))
-                    if axis_min or axis_max:
-                        # clamp and retry once
-                        if axis_min:
-                            start_iso = _to_iso(axis_min)
-                        if axis_max:
-                            end_iso = _to_iso(axis_max)
-                        # rebuild url with clamped times and retry for both orderings next loop iteration
-                        continue
+                # if 404, attempt to extract axis hints and continue (defensive)
                 continue
-            # successful 200, parse CSV
             df = pd.read_csv(io.StringIO(r.text))
-            # normalize columns
             col_lower = {c.lower(): c for c in df.columns}
             if 'time' in col_lower:
                 df.rename(columns={col_lower['time']: 'time'}, inplace=True)
@@ -260,30 +327,23 @@ def fetch_griddap_point_timeseries_using_dataset_time(server, dataset_id, variab
                 df.rename(columns={col_lower['longitude']: 'longitude'}, inplace=True)
             elif 'lon' in col_lower:
                 df.rename(columns={col_lower['lon']: 'longitude'}, inplace=True)
-
             if 'latitude' in df.columns:
                 df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
             if 'longitude' in df.columns:
                 df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-
             value_cols = [c for c in df.columns if c not in ('time', 'latitude', 'longitude')]
             for c in value_cols:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-
             if 'time' in df.columns:
                 df = df.dropna(subset=['time'])
-
             if df.empty:
                 continue
-
             if debug:
                 return df, raw_texts
             return df
         except Exception:
-            # on network errors, continue trying other order
             continue
 
-    # If we reach here, no data found
     if debug:
         return pd.DataFrame(), raw_texts
     return pd.DataFrame()
@@ -312,66 +372,16 @@ PREFERRED_DATASETS = {
 }
 
 
-def get_dataset_variables(server, dataset_id, timeout=8):
-    """
-    Read dataset index.csv to get variable names. Returns list or empty list.
-    """
-    try:
-        url = f"{server}/info/{dataset_id}/index.csv"
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text), dtype=str)
-        cols = [c for c in df.columns if 'variable' in c.lower() and 'name' in c.lower()]
-        if not cols:
-            cols = [c for c in df.columns if 'destination' in c.lower() or 'destinationname' in c.lower()]
-        if not cols:
-            if 'Row Type' in df.columns:
-                vars_df = df[df['Row Type'].astype(str).str.lower() == 'variable']
-                if 'Variable Name' in vars_df.columns:
-                    return vars_df['Variable Name'].dropna().astype(str).unique().tolist()
-            return []
-        var_col = cols[0]
-        vars_list = df[var_col].dropna().astype(str).unique().tolist()
-        return [v.strip() for v in vars_list if v.strip()]
-    except Exception:
-        return []
-
-
-def _normalize_colname(s: str) -> str:
-    return re.sub(r'\W+', '', str(s)).lower()
-
-
-def discover_erddap_datasets(server=ERDDAP_SERVER, keyword="sst", max_results=20):
-    try:
-        q = requests.utils.requote_uri(f"{server}/search/index.csv?searchFor={keyword}&itemsPerPage={max_results}")
-        r = requests.get(q, timeout=20)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        col_map = { _normalize_colname(c): c for c in df.columns }
-        candidates = ['datasetid', 'dataset_id', 'dataset', 'datasetname']
-        dataset_col = None
-        for cand in candidates:
-            if cand in col_map:
-                dataset_col = col_map[cand]
-                break
-        title_col = None
-        for cand in ['title', 'datasettitle', 'titletext']:
-            if cand in col_map:
-                title_col = col_map[cand]
-                break
-        if dataset_col:
-            df = df.copy()
-            df.rename(columns={dataset_col: 'dataset_id'}, inplace=True)
-            if title_col:
-                df.rename(columns={title_col: 'title'}, inplace=True)
-                return df[['dataset_id', 'title']].drop_duplicates().reset_index(drop=True)
-            return df[['dataset_id']].drop_duplicates().reset_index(drop=True)
-        return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+def get_preferred_for(friendly_variable):
+    """Return preferred dataset list (dataset_id, varname) for a friendly variable."""
+    return PREFERRED_DATASETS.get(friendly_variable, [])
 
 
 def pick_dataset_and_var(server, friendly_variable):
+    """
+    Return (dataset_id, variable_name) or (None, None).
+    Uses PREFERRED_DATASETS first then discovery on server.
+    """
     if friendly_variable not in DEFAULT_VARIABLES:
         return None, None
     info = DEFAULT_VARIABLES[friendly_variable]
@@ -388,6 +398,7 @@ def pick_dataset_and_var(server, friendly_variable):
             for v in vars_list:
                 if v.lower() == candidate.lower():
                     return ds_id, v
+    # discover
     df = discover_erddap_datasets(server, info['search_kw'])
     if df.empty:
         df = discover_erddap_datasets(server, friendly_variable.lower())
