@@ -61,8 +61,8 @@ def _safe_request(url, timeout=30):
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         return r
-    except Exception as e:
-        return e
+    except Exception:
+        return None
 
 # -------------------------
 # Geocoding
@@ -127,19 +127,26 @@ def _extract_variable_names_from_info(info_json):
     vars_guess = [t for t in tokens if t.lower() not in exclude and len(t) < 60]
     return vars_guess[:200]
 
-def validate_dataset_for_keywords(server, dataset_id, keywords):
+def validate_dataset_for_keywords(server, dataset_id, keywords, accept_if_candidates: bool = False):
     """
     Validate dataset by checking info JSON contains any of keywords.
     Returns dict {valid:bool, variables:list, info:json}
+    - accept_if_candidates: if True, treat dataset as valid when heuristic variable candidates exist.
     """
     info = get_dataset_info(server, dataset_id)
     if not info:
         return {"valid": False, "variables": [], "info": None}
     txt = str(info).lower()
     found = [k for k in keywords if k.lower() in txt]
-    # Extract other candidates
+    # Extract other candidates (heuristic)
     candidates = _extract_variable_names_from_info(info)
-    return {"valid": True, "variables": found + candidates, "info": info}
+    valid = False
+    if found:
+        valid = True
+    elif accept_if_candidates and candidates:
+        valid = True
+    return {"valid": valid, "variables": found + candidates, "info": info}
+
 
 def discover_dataset(server, friendly_var, search_phrases, var_keywords, curated_fallback=None):
     """
@@ -276,21 +283,43 @@ def _try_griddap_point(server, dataset_id, variable, start_iso, end_iso, lat, lo
 def _try_tabledap(server, dataset_id, variable, start_iso, end_iso, lat, lon, timeout=60):
     """
     Attempt a tabledap request to fetch rows matching the lat/lon and time range.
-    Tabledap is useful for profiles because it often includes depth rows.
     Returns (df, debug_list).
     """
+    from pandas.errors import ParserError
+
     debug = []
-    # Build a where-like query: var,time>=...,time<=...,latitude=...,longitude=...
+    # Build selection: ask for variable column (or all if None/empty)
     var_part = variable if variable else ""
-    # tabledap supports simple equality for lat/lon; some servers may require rounding
-    url = f"{server.rstrip('/')}/tabledap/{urllib.parse.quote(dataset_id)}.csv?{urllib.parse.quote(var_part)}&time>={start_iso}&time<={end_iso}&latitude={lat}&longitude={lon}"
+    # Using params ensures proper URL encoding for comparison operators
+    query_cols = var_part or ""
+    # Build the tabledap query string part for columns (if empty this will request all columns)
+    # Many ERDDAP servers accept queries like: dataset.csv?var&time>=...&time<=...&latitude=...&longitude=...
+    params = {}
+    # If requesting a single column, place it in the url path portion (left of '?')
+    # We'll build a params dict for the filter portion:
+    params[f"time>="] = start_iso
+    params[f"time<="] = end_iso
+    params["latitude"] = lat
+    params["longitude"] = lon
+
+    # Build the URL base (we will append the column list manually if provided)
+    base = f"{server.rstrip('/')}/tabledap/{urllib.parse.quote(dataset_id)}.csv"
+    if query_cols:
+        url = f"{base}?{urllib.parse.quote(query_cols)}"
+    else:
+        url = f"{base}"
     try:
-        r = requests.get(url, timeout=timeout)
-        snippet = r.text[:2000] if isinstance(r.text, str) else f"HTTP {r.status_code}"
-        debug.append((url, snippet))
+        # Use requests to build the final URL properly
+        r = requests.get(url, params=params, timeout=timeout)
+        snippet = (r.text[:1500] + '...') if isinstance(r.text, str) and len(r.text) > 1500 else (r.text if isinstance(r.text, str) else f"HTTP {r.status_code}")
+        debug.append((r.url if hasattr(r, 'url') else url, snippet))
         if r.status_code != 200:
             return pd.DataFrame(), debug
-        df = pd.read_csv(io.StringIO(r.text))
+        try:
+            df = pd.read_csv(io.StringIO(r.text))
+        except ParserError as pe:
+            debug.append((r.url, f"PARSER_ERROR:{pe}"))
+            return pd.DataFrame(), debug
         # Normalize common depth names
         cols_lower = {c.lower(): c for c in df.columns}
         rename = {}
@@ -306,6 +335,7 @@ def _try_tabledap(server, dataset_id, variable, start_iso, end_iso, lat, lon, ti
     except Exception as e:
         debug.append((url, f"EXC:{e}"))
         return pd.DataFrame(), debug
+
 
 def fetch_with_3d_support(server, dataset_id, variable, lat, lon, start_dt, end_dt, prefer_tabledap_for_profiles=True, timeout=60):
     """
@@ -714,4 +744,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```0
