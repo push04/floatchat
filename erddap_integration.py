@@ -66,6 +66,11 @@ def get_dataset_variables(server, dataset_id, timeout=20):
         print(f"[get_dataset_variables] failed: {e}")
         return []
 
+def get_preferred_for(friendly_variable):
+    """Return preferred dataset list (dataset_id, varname) for a friendly variable."""
+    return PREFERRED_DATASETS.get(friendly_variable, [])
+
+
 # -------------------------
 # Utils
 # -------------------------
@@ -237,12 +242,59 @@ DEFAULT_VARIABLES = {
     'Chlorophyll': {'search_kw': 'chlorophyll OR chlor_a', 'var_names': ['chlorophyll', 'chlor_a', 'chl']},
 }
 
+# ---------- Preferred datasets for common project needs ----------
+# Map friendly variable category -> list of preferred (dataset_id, variable_name) tuples in order.
+# These are tried first by pick_dataset_and_var() before searching the ERDDAP index.
+PREFERRED_DATASETS = {
+    'Temperature': [
+        # OISST daily/monthly gridded SST (NOAA OISST)
+        ('ncdc_oisst_v2_avhrr_by_time_zlev_lat_lon', 'sst'),
+        ('ncdc_oisst_v2_avhrr_amsr_by_time_zlev_lat_lon', 'sst'),
+        # Model-based SST (if you want model alternatives)
+        ('NCOM_amseas_latest3d', 'water_temp'),   # example NCOM dataset — variable name may differ per specific NCOM dataset
+    ],
+    'Salinity': [
+        # Model-derived salinity (NCOM family; variable name may be 'salinity' or 'salinity_anom')
+        ('NCOM_amseas_latest3d', 'salinity'),
+        # In-situ monitoring network (tabledap) — will likely be tabledap (use manual override if griddap fails)
+        ('bedi_PMN', 'salinity'),
+    ],
+    'Chlorophyll': [
+        # VIIRS / ocean color datasets (variable name often 'chlor_a' or 'CHL')
+        ('USM_VIIRS_DAP', 'chlor_a'),
+        ('USM_VIIRS_DAP', 'CHL'),  # try alternate names if first fails
+    ],
+    'HeatStress': [
+        # NOAA Degree Heating Weeks / DHW products — variable names vary (check dataset info)
+        ('NOAA_DHW_monthly', 'DHW'),   # placeholder; override with exact var name if different
+        ('NOAA_DHW_monthly', 'heatstress'), 
+    ],
+}
+
 
 def pick_dataset_and_var(server, friendly_variable):
     """
     Try to discover a dataset and a plausible variable name for the friendly_variable.
     Returns (dataset_id, variable_name) or (None, None).
     """
+       # Prefer explicit dataset mapping for common project datasets
+    try:
+        # if we have a preferred list for this friendly variable, try those first
+        prefs = PREFERRED_DATASETS.get(friendly_variable, [])
+        for ds_id, varname in prefs:
+            # quick test whether this dataset exposes the variable by hitting a tiny slice
+            test_url = f"{server}/griddap/{ds_id}.csv?{varname}[(1970-01-01T00:00:00Z):1:(1970-01-01T00:00:00Z)][(0):1:(0)][(0):1:(0)]"
+            try:
+                r = requests.get(test_url, timeout=8)
+                if r.status_code == 200 and 'Error' not in r.text and len(r.text) > 50:
+                    return ds_id, varname
+            except Exception:
+                continue
+    except Exception:
+        # if preferred lookup fails for any reason, continue to discovery-based logic
+        pass
+
+   
     if friendly_variable not in DEFAULT_VARIABLES:
         return None, None
     info = DEFAULT_VARIABLES[friendly_variable]
@@ -340,6 +392,13 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
 
     st.sidebar.header('Ocean data (ERDDAP)')
     var_choice = st.sidebar.selectbox('Variable', list(DEFAULT_VARIABLES.keys()))
+       # Show recommended datasets for this variable (helps user choose overrides quickly)
+    prefs = get_preferred_for(var_choice)
+    if prefs:
+        st.sidebar.markdown("**Recommended datasets:**")
+        for ds, vn in prefs:
+            st.sidebar.caption(f"{ds}  —  try var `{vn}`")
+
     place = st.sidebar.text_input('Place name (or leave blank to enter lat,lon manually)')
     manual_latlon = st.sidebar.text_input('Manual lat,lon (e.g. "20.5,70.2")')
     # Year-range selector (replaces days slider)
