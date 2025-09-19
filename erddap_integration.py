@@ -49,6 +49,14 @@ ERDDAP_SERVER = "https://coastwatch.noaa.gov/erddap"
 # How many days in the past defines the switch from NRT to historical data.
 NRT_CUTOFF_DAYS = 60
 
+# curated SST dataset IDs (help discovery when search/index.csv misses them)
+CURATED_SST_DATASETS = [
+    "noaacwBLENDEDsstDaily",
+    "noaacwBLENDEDsstDNDaily",
+    "OISSTs_2022_v05_1",
+    "jplMURSST41anom1day"
+]
+
 # Small helper(s)
 def _format_iso(dt: datetime) -> str:
     """Return UTC Z-suffixed ISO string for ERDDAP queries."""
@@ -537,7 +545,16 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
         }
         search_terms, var_keywords = heuristics[var_choice]
         with st.spinner("Searching for dataset..."):
-            ds_id, var_guess, note = discover_dataset(server_input, var_choice, search_terms, var_keywords, curated_fallback=None)
+            ds_id, var_guess, note = discover_dataset(
+                server_input, var_choice, search_terms, var_keywords,
+                curated_fallback=CURATED_SST_DATASETS if var_choice == "Temperature" else None
+            )
+        # if dataset found but no variable guessed, attempt to extract candidates
+        if ds_id and not var_guess:
+            info = get_dataset_info(server_input, ds_id)
+            vars_candidates = _extract_variable_names_from_info(info)
+            if vars_candidates:
+                var_guess = vars_candidates[0]
         if not ds_id:
             st.error("No dataset found: " + note)
             return
@@ -627,12 +644,21 @@ def register_erddap_blueprint(app, server=ERDDAP_SERVER):
                 end_dt = datetime.now(timezone.utc)
                 start_dt = end_dt - timedelta(days=30)
             heuristics = {
-                "Temperature": (["sea surface temperature","sst"], ["analysed_sst","sea_surface_temperature","sst","temperature"]),
+                "Temperature": (["sea surface temperature","sst"], ["analysed_sst","sea_surface_temperature","sst","temperature","sstAnom","sst_anom"]),
                 "Salinity": (["salinity","sss"], ["salinity","sea_surface_salinity","sss"]),
                 "Chlorophyll": (["chlorophyll","chl"], ["chlor_a","chl","CHL_Weekly","chlorophyll"])
             }
             search_terms, var_keywords = heuristics[var_choice]
-            ds_id, var_guess, note = discover_dataset(server, var_choice, search_terms, var_keywords)
+            ds_id, var_guess, note = discover_dataset(
+                server, var_choice, search_terms, var_keywords,
+                curated_fallback=CURATED_SST_DATASETS if var_choice == "Temperature" else None
+            )
+            # if dataset found but no variable guessed, attempt to extract candidates
+            if ds_id and not var_guess:
+                info = get_dataset_info(server, ds_id)
+                vars_candidates = _extract_variable_names_from_info(info)
+                if vars_candidates:
+                    var_guess = vars_candidates[0]
             if not ds_id:
                 output = f"<p style='color:red;'>No dataset found: {html.escape(note)}</p>"
                 return render_template_string(HTML, output=output, **form)
@@ -701,14 +727,22 @@ def main():
         start_dt = end_dt - timedelta(days=30)
     print("Time range:", _format_iso(start_dt), "to", _format_iso(end_dt))
     heuristics = {
-        "Temperature": (["sea surface temperature", "sst"], ["analysed_sst","sea_surface_temperature","sst","temperature"]),
+        "Temperature": (["sea surface temperature", "sst"], ["analysed_sst","sea_surface_temperature","sst","temperature","sstAnom","sst_anom"]),
         "Salinity": (["salinity", "sss"], ["salinity","sea_surface_salinity","sss"]),
         "Chlorophyll": (["chlorophyll", "chl"], ["chlor_a","chl","CHL_Weekly","chlorophyll"])
     }
     search_terms, var_keywords = heuristics[args.var_friendly]
     print("Discovering datasets...")
-    ds_id, var_guess, note = discover_dataset(server, args.var_friendly, search_terms, var_keywords,
-                                              curated_fallback=None)
+    ds_id, var_guess, note = discover_dataset(
+        server, args.var_friendly, search_terms, var_keywords,
+        curated_fallback=CURATED_SST_DATASETS if args.var_friendly == "Temperature" else None
+    )
+    # If dataset found but no variable guessed, try extracting from info JSON
+    if ds_id and not var_guess:
+        info = get_dataset_info(server, ds_id)
+        vars_candidates = _extract_variable_names_from_info(info)
+        if vars_candidates:
+            var_guess = vars_candidates[0]
     if not ds_id:
         print("No dataset found automatically. Aborting. Note:", note)
         sys.exit(5)
