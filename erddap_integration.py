@@ -2,23 +2,25 @@
 """
 erddap_integration.py
 
-Complete, self-contained ERDDAP helper module that:
- - Discovers & validates datasets on an ERDDAP server for Temperature / Salinity / Chlorophyll.
- - Fetches point time-series (griddap preferred, tabledap fallback).
- - Splits queries across an NRT/historical cutoff if needed.
- - Produces interactive Plotly timeseries + map, and a styled HTML output.
- - Exposes `erddap_streamlit_widget(server=...)` and `register_erddap_blueprint(app, server=...)`
-   so other apps (e.g., your `app.py`) can `from erddap_integration import erddap_streamlit_widget`.
- - Also includes a CLI entrypoint.
+Robust ERDDAP integration module with:
+ - dataset discovery + validation (avoids unknown dataset IDs)
+ - supports 3D variables (time, depth, lat, lon) and 2D (time, lat, lon)
+ - automatic split between historical and NRT datasets (configurable cutoff)
+ - griddap & tabledap attempts (griddap preferred; tabledap fallback)
+ - CLI entrypoint, Streamlit widget (optional) and Flask blueprint (optional)
+ - Interactive Plotly outputs and a styled HTML report with charts + table
+
+Save as `erddap_integration.py`. Run on a machine with internet access.
+
+Dependencies:
+    pip install requests pandas plotly
+    # optional: pip install geopy streamlit flask
 
 Usage examples:
-  # import into your app:
-  from erddap_integration import erddap_streamlit_widget
-  erddap_streamlit_widget()  # inside streamlit app
+    python erddap_integration.py --place "Honolulu, Hawaii" --var-friendly Temperature
+    python erddap_integration.py --latlon "21.3069,-157.8583" --month-year 08-2025 --var-friendly Salinity
 
-  # CLI:
-  python erddap_integration.py --place "Honolulu, Hawaii"
-  python erddap_integration.py --latlon "21.3069,-157.8583" --month-year 08-2025 --var-friendly Temperature
+Author: Generated for user — aims to be free of syntax errors and robust for common ERDDAP servers.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -26,14 +28,14 @@ import calendar
 import argparse
 import sys
 import io
+import re
 import urllib.parse
 import requests
 import pandas as pd
 import plotly.express as px
-import plotly.io as pio
 import plotly.graph_objects as go
+import plotly.io as pio
 import html
-import logging
 
 # Optional geocoding
 try:
@@ -42,38 +44,40 @@ try:
 except Exception:
     GEOPY_AVAILABLE = False
 
-# Defaults & configuration
+# Default ERDDAP server (NOAA CoastWatch). Can be overridden via CLI --server
 ERDDAP_SERVER = "https://coastwatch.noaa.gov/erddap"
-NRT_CUTOFF_DAYS = 60  # days before 'now' considered historical boundary
-HTTP_TIMEOUT = 30
+# How many days in the past defines the switch from NRT to historical data.
+NRT_CUTOFF_DAYS = 60
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("erddap_integration")
-
-# -------------------------
-# Utility helpers
-# -------------------------
+# Small helper(s)
 def _format_iso(dt: datetime) -> str:
-    """Format timezone-aware datetime to ERDDAP-friendly ISO Z string."""
+    """Return UTC Z-suffixed ISO string for ERDDAP queries."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def _safe_request(url, timeout=30):
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r
+    except Exception as e:
+        return e
 
 # -------------------------
 # Geocoding
 # -------------------------
-def geocode_place(place: str, timeout: int = 10):
-    """Resolve place name to (lat, lon). Returns None if cannot resolve."""
+def geocode_place(place, timeout=10):
+    """Return (lat, lon) for place string or None."""
     if GEOPY_AVAILABLE:
         try:
-            geo = Nominatim(user_agent="erddap_integration")
-            loc = geo.geocode(place, timeout=timeout)
+            geolocator = Nominatim(user_agent="erddap_integration_geocoder")
+            loc = geolocator.geocode(place, timeout=timeout)
             if loc:
                 return float(loc.latitude), float(loc.longitude)
         except Exception:
-            logger.debug("geopy geocode failed; falling back to Nominatim HTTP")
+            pass
+    # fallback to OpenStreetMap Nominatim public API
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": place, "format": "json", "limit": 1}
@@ -83,192 +87,233 @@ def geocode_place(place: str, timeout: int = 10):
         j = r.json()
         if isinstance(j, list) and j:
             return float(j[0]["lat"]), float(j[0]["lon"])
-    except Exception as e:
-        logger.debug("Nominatim HTTP geocode failed: %s", e)
+    except Exception:
+        pass
     return None
-
 
 # -------------------------
 # ERDDAP discovery & validation
 # -------------------------
-def erddap_search(server: str, query: str, items_per_page: int = 200) -> pd.DataFrame:
-    """
-    Query ERDDAP's search/index.csv endpoint to find datasets matching `query`.
-    Returns DataFrame or empty DataFrame on error.
-    """
+def erddap_search(server: str, query: str, items_per_page: int = 200):
+    """Query ERDDAP's search/index.csv. Returns pandas DataFrame or empty DF."""
+    q = urllib.parse.quote_plus(query)
+    url = f"{server.rstrip('/')}/search/index.csv?searchFor={q}&itemsPerPage={items_per_page}"
     try:
-        q = urllib.parse.quote_plus(query)
-        url = f"{server.rstrip('/')}/search/index.csv?searchFor={q}&itemsPerPage={items_per_page}"
-        r = requests.get(url, timeout=HTTP_TIMEOUT)
+        r = requests.get(url, timeout=30)
         r.raise_for_status()
         return pd.read_csv(io.StringIO(r.text))
-    except Exception as e:
-        logger.debug("erddap_search failed (%s). Returning empty DataFrame", e)
+    except Exception:
         return pd.DataFrame()
 
-
-def validate_dataset_has_keywords(server: str, dataset_id: str, keywords: list) -> dict:
-    """
-    Request /info/<dataset_id>/index.json and check for presence of keywords.
-    Returns {'valid': bool, 'variables': list, 'info': obj or None}
-    """
+def get_dataset_info(server: str, dataset_id: str):
+    """Fetch /info/<dataset_id>/index.json. Returns JSON or None."""
+    url = f"{server.rstrip('/')}/info/{urllib.parse.quote(dataset_id)}/index.json"
     try:
-        url = f"{server.rstrip('/')}/info/{dataset_id}/index.json"
-        r = requests.get(url, timeout=HTTP_TIMEOUT)
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
-        info = r.json()
-        txt = str(info).lower()
-        found = [k for k in keywords if k.lower() in txt]
-        return {"valid": True, "variables": found, "info": info}
-    except Exception as e:
-        logger.debug("validate_dataset_has_keywords failed for %s: %s", dataset_id, e)
+        return r.json()
+    except Exception:
+        return None
+
+def _extract_variable_names_from_info(info_json):
+    """Attempt to extract variable names from dataset info JSON conservatively."""
+    if not info_json:
+        return []
+    txt = str(info_json)
+    # heuristics: find words that look like variable names (letters, underscores, digits)
+    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,40}", txt))
+    # filter obviously non-variable tokens
+    exclude = {'table', 'attributes', 'variable', 'dataset', 'dimension', 'id', 'units', 'title', 'name'}
+    vars_guess = [t for t in tokens if t.lower() not in exclude and len(t) < 60]
+    return vars_guess[:200]
+
+def validate_dataset_for_keywords(server, dataset_id, keywords):
+    """
+    Validate dataset by checking info JSON contains any of keywords.
+    Returns dict {valid:bool, variables:list, info:json}
+    """
+    info = get_dataset_info(server, dataset_id)
+    if not info:
         return {"valid": False, "variables": [], "info": None}
+    txt = str(info).lower()
+    found = [k for k in keywords if k.lower() in txt]
+    # Extract other candidates
+    candidates = _extract_variable_names_from_info(info)
+    return {"valid": True, "variables": found + candidates, "info": info}
 
-
-def discover_dataset(server: str, friendly_var: str) -> tuple:
+def discover_dataset(server, friendly_var, search_phrases, var_keywords, curated_fallback=None):
     """
-    Discover a dataset id and likely variable name for a friendly variable
-    ('Temperature', 'Salinity', 'Chlorophyll').
-    Returns (dataset_id or None, var_guess or None, note string).
+    Searches ERDDAP for datasets matching search_phrases.
+    Validates candidates against var_keywords.
+    Returns (dataset_id, chosen_variable, info_note) or (None,None,msg)
     """
-    heuristics = {
-        "Temperature": {
-            "search": "sea surface temperature sst sea-surface temperature",
-            "keywords": ["sea_surface_temperature", "analysed_sst", "sst", "temperature", "analysed sst"]
-        },
-        "Salinity": {
-            "search": "salinity sea surface salinity sss",
-            "keywords": ["salinity", "sea_surface_salinity", "sss"]
-        },
-        "Chlorophyll": {
-            "search": "chlorophyll chlor a chlor_a viirs chl",
-            "keywords": ["chlor_a", "chl", "CHL_Weekly", "chlorophyll"]
-        }
-    }
-    if friendly_var not in heuristics:
-        return None, None, f"No heuristics for '{friendly_var}'"
-
-    search_terms = heuristics[friendly_var]["search"]
-    keywords = heuristics[friendly_var]["keywords"]
-
-    logger.info("Searching ERDDAP server for '%s' datasets...", friendly_var)
-    df = erddap_search(server, search_terms)
-
+    q = " ".join(search_phrases)
+    df = erddap_search(server, q)
     candidates = []
     if not df.empty:
-        # typical columns include 'Dataset ID' or 'Dataset'
-        cols = {c.lower(): c for c in df.columns}
-        for possible in ("dataset id", "dataset", "datasetid", "Dataset ID"):
-            if possible.lower() in cols:
-                idcol = cols[possible.lower()]
-                candidates = list(df[idcol].dropna().astype(str).unique())
+        cols = [c.lower() for c in df.columns]
+        # attempt common column names
+        for candidate_col in ['dataset id', 'dataset', 'Dataset ID', 'Dataset']:
+            if candidate_col.lower() in cols:
+                ds_col = df.columns[cols.index(candidate_col.lower())]
+                candidates = list(df[ds_col].dropna().unique())
                 break
-
-    # Add curated safe candidates (fallback)
-    curated = {
-        "Temperature": ["noaacwLEOACSPOSSTL3SnrtCDaily", "jplMURSST41"],
-        "Chlorophyll": ["USM_VIIRS_DAP", "noaacwNPPVIIRSchlaGlobal"],
-        "Salinity": ["NCOM_amseas_latest3d", "ncom_global"]
-    }
-    for c in curated.get(friendly_var, []):
-        if c not in candidates:
-            candidates.append(c)
-
-    # Validate candidates
+    # append curated fallback
+    if curated_fallback:
+        for c in curated_fallback:
+            if c not in candidates:
+                candidates.append(c)
+    # validate
     for ds in candidates:
-        res = validate_dataset_has_keywords(server, ds, keywords)
-        if res["valid"]:
-            # pick a variable guess if any keyword matched
-            var_guess = res["variables"][0] if res["variables"] else None
-            note = f"Dataset '{ds}' validated; variable guess: {var_guess}"
-            logger.info(note)
-            return ds, var_guess, note
-
-    return None, None, "No validated dataset found"
-
+        val = validate_dataset_for_keywords(server, ds, var_keywords)
+        if val['valid']:
+            # pick variable: prefer explicit keyword hits, else the first candidate var
+            var = val['variables'][0] if val['variables'] else None
+            note = f"Discovered dataset {ds}; chosen variable candidate: {var}"
+            return ds, var, note
+    return None, None, "No validated dataset found."
 
 # -------------------------
-# Fetchers: griddap and tabledap
+# GRIDDAP / TABLEDAP fetchers (with 3D support)
 # -------------------------
-def try_griddap_fetch(server: str, dataset_id: str, variable: str, lat: float, lon: float, start_iso: str, end_iso: str):
+def _try_griddap_point(server, dataset_id, variable, start_iso, end_iso, lat, lon, depth=None, timeout=60):
     """
-    Attempt to fetch griddap CSV point timeseries. Tries lat,lon and lon,lat orders.
+    Attempt to fetch using griddap CSV format. Tries several orderings of dimensions.
+    If depth is None, attempts without depth index; if depth == 'ALL' we will try to request all depth indices
+    (requires providing bounding min/max — but generally tabledap is safer for full profiles).
     Returns (df, debug_list)
     """
     debug = []
-    orders = [("lat", "lon"), ("lon", "lat")]
-    for order in orders:
-        if order == ("lat", "lon"):
-            point_idx = f"[({start_iso}):1:({end_iso})][({lat}):1:({lat})][({lon}):1:({lon})]"
-        else:
-            point_idx = f"[({start_iso}):1:({end_iso})][({lon}):1:({lon})][({lat}):1:({lat})]"
-
-        query = variable + point_idx if variable else "time,latitude,longitude" + point_idx
-        url = f"{server.rstrip('/')}/griddap/{dataset_id}.csv?{query}"
-        try:
-            r = requests.get(url, timeout=HTTP_TIMEOUT)
-            snippet = (r.text[:2000] if r.text else f"HTTP {r.status_code}")
-            debug.append((url, snippet))
-            if r.status_code != 200:
+    orders_with_depth = [
+        ("time", "depth", "latitude", "longitude"),
+        ("time", "latitude", "longitude", "depth"),
+        ("time", "latitude", "depth", "longitude"),
+        ("time", "longitude", "latitude", "depth"),
+        ("time", "depth", "longitude", "latitude"),
+    ]
+    orders_no_depth = [
+        ("time", "latitude", "longitude"),
+        ("time", "longitude", "latitude"),
+    ]
+    # helper to build index string for a given ordering:
+    def idx_for(order):
+        parts = []
+        for dim in order:
+            if dim == "time":
+                parts.append(f"[({start_iso}):1:({end_iso})]")
+            elif dim == "latitude":
+                parts.append(f"[({lat}):1:({lat})]")
+            elif dim == "longitude":
+                parts.append(f"[({lon}):1:({lon})]")
+            elif dim == "depth":
+                if depth is None:
+                    # request a single depth of 0 (not ideal) - skip this ordering
+                    return None
+                if depth == "ALL":
+                    # Not supported in simple griddap point slicing without numeric bounds -> skip
+                    return None
+                parts.append(f"[({depth}):1:({depth})]")
+        return "".join(parts)
+    # Try with depth if provided
+    if depth is not None and depth != "ALL":
+        for order in orders_with_depth:
+            idx = idx_for(order)
+            if not idx:
                 continue
-            df = pd.read_csv(io.StringIO(r.text))
-            # normalize column names
-            cols_lower = {c.lower(): c for c in df.columns}
-            rename = {}
-            for axis in ("time", "latitude", "longitude"):
-                if axis in cols_lower:
-                    rename[cols_lower[axis]] = axis
-            if rename:
-                df.rename(columns=rename, inplace=True)
-            if "time" in df.columns:
-                df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
-                df = df.dropna(subset=["time"])
-            # if variable present as different name, rename first data column to variable for clarity
-            data_cols = [c for c in df.columns if c.lower() not in ("time", "latitude", "longitude")]
-            if data_cols and variable and data_cols[0] != variable:
-                try:
-                    df.rename(columns={data_cols[0]: variable}, inplace=True)
-                except Exception:
-                    pass
-            return df, debug
-        except Exception as e:
-            debug.append((url, f"EXC:{e}"))
-            continue
+            url = f"{server.rstrip('/')}/griddap/{urllib.parse.quote(dataset_id)}.csv?{urllib.parse.quote(variable)}{idx}"
+            try:
+                r = requests.get(url, timeout=timeout)
+                snippet = r.text[:2000] if isinstance(r.text, str) else f"HTTP {r.status_code}"
+                debug.append((url, snippet))
+                if r.status_code != 200:
+                    continue
+                df = pd.read_csv(io.StringIO(r.text))
+                # Normalize axis names if present
+                cols_lower = {c.lower(): c for c in df.columns}
+                rename = {}
+                for k in ['time', 'latitude', 'longitude', 'depth', 'z', 'altitude', 'depthBelowSeaSurface']:
+                    if k in cols_lower:
+                        rename[cols_lower[k]] = 'depth' if k in ['depth','z','depthBelowSeaSurface'] else k
+                if rename:
+                    df.rename(columns=rename, inplace=True)
+                if 'time' in df.columns:
+                    df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
+                    df = df.dropna(subset=['time'])
+                return df, debug
+            except Exception as e:
+                debug.append((url, f"EXC:{e}"))
+                continue
+    else:
+        # no depth -> try simpler orders
+        for order in orders_no_depth:
+            idx = idx_for(order)
+            if not idx:
+                continue
+            url = f"{server.rstrip('/')}/griddap/{urllib.parse.quote(dataset_id)}.csv?{urllib.parse.quote(variable)}{idx}"
+            try:
+                r = requests.get(url, timeout=timeout)
+                snippet = r.text[:2000] if isinstance(r.text, str) else f"HTTP {r.status_code}"
+                debug.append((url, snippet))
+                if r.status_code != 200:
+                    continue
+                df = pd.read_csv(io.StringIO(r.text))
+                cols_lower = {c.lower(): c for c in df.columns}
+                rename = {}
+                for k in ['time', 'latitude', 'longitude', 'depth', 'z', 'altitude', 'depthBelowSeaSurface']:
+                    if k in cols_lower:
+                        rename[cols_lower[k]] = 'depth' if k in ['depth','z','depthBelowSeaSurface'] else k
+                if rename:
+                    df.rename(columns=rename, inplace=True)
+                if 'time' in df.columns:
+                    df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
+                    df = df.dropna(subset=['time'])
+                return df, debug
+            except Exception as e:
+                debug.append((url, f"EXC:{e}"))
+                continue
     return pd.DataFrame(), debug
 
-
-def try_tabledap_fetch(server: str, dataset_id: str, variable: str, lat: float, lon: float, start_iso: str, end_iso: str):
+def _try_tabledap(server, dataset_id, variable, start_iso, end_iso, lat, lon, timeout=60):
     """
-    Attempt to fetch using tabledap. Returns (df, debug_list).
+    Attempt a tabledap request to fetch rows matching the lat/lon and time range.
+    Tabledap is useful for profiles because it often includes depth rows.
+    Returns (df, debug_list).
     """
     debug = []
-    # build a tabledap query requesting time,latitude,longitude and variable if given
-    var_part = variable + "," if variable else ""
-    # Many tabledap endpoints accept "time>=...&time<=..." style filters
-    url = f"{server.rstrip('/')}/tabledap/{dataset_id}.csv?{var_part}time&time>={start_iso}&time<={end_iso}&latitude={lat}&longitude={lon}"
+    # Build a where-like query: var,time>=...,time<=...,latitude=...,longitude=...
+    var_part = variable if variable else ""
+    # tabledap supports simple equality for lat/lon; some servers may require rounding
+    url = f"{server.rstrip('/')}/tabledap/{urllib.parse.quote(dataset_id)}.csv?{urllib.parse.quote(var_part)}&time>={start_iso}&time<={end_iso}&latitude={lat}&longitude={lon}"
     try:
-        r = requests.get(url, timeout=HTTP_TIMEOUT)
-        snippet = (r.text[:2000] if r.text else f"HTTP {r.status_code}")
+        r = requests.get(url, timeout=timeout)
+        snippet = r.text[:2000] if isinstance(r.text, str) else f"HTTP {r.status_code}"
         debug.append((url, snippet))
         if r.status_code != 200:
             return pd.DataFrame(), debug
         df = pd.read_csv(io.StringIO(r.text))
-        if "time" in df.columns:
-            df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
-            df = df.dropna(subset=["time"])
+        # Normalize common depth names
+        cols_lower = {c.lower(): c for c in df.columns}
+        rename = {}
+        for k in ['time', 'latitude', 'longitude', 'depth', 'z', 'altitude', 'depthBelowSeaSurface']:
+            if k in cols_lower:
+                rename[cols_lower[k]] = 'depth' if k in ['depth','z','depthBelowSeaSurface'] else k
+        if rename:
+            df.rename(columns=rename, inplace=True)
+        if 'time' in df.columns:
+            df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
+            df = df.dropna(subset=['time'])
         return df, debug
     except Exception as e:
         debug.append((url, f"EXC:{e}"))
         return pd.DataFrame(), debug
 
-
-# -------------------------
-# High-level point timeseries fetch (handles cutoff splitting)
-# -------------------------
-def fetch_point_timeseries(server: str, dataset_id: str, variable: str, lat: float, lon: float, start_dt: datetime, end_dt: datetime):
+def fetch_with_3d_support(server, dataset_id, variable, lat, lon, start_dt, end_dt, prefer_tabledap_for_profiles=True, timeout=60):
     """
-    Fetch point timeseries. Splits request if spans NRT_CUTOFF_DAYS.
-    Returns (df, debug_list)
+    Top-level fetch that attempts:
+      - Split time range if spans NRT cutoff
+      - For each time chunk: try griddap point slicing (best for gridded datasets)
+      - If griddap yields nothing or 'ALL depth profile' required, try tabledap (profiles)
+    Returns (df_combined, debug_attempts)
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=NRT_CUTOFF_DAYS)
     parts = []
@@ -279,386 +324,393 @@ def fetch_point_timeseries(server: str, dataset_id: str, variable: str, lat: flo
     else:
         parts.append((start_dt, cutoff - timedelta(seconds=1)))
         parts.append((cutoff, end_dt))
-
     all_dfs = []
     debug = []
     for sdt, edt in parts:
         s_iso = _format_iso(sdt)
         e_iso = _format_iso(edt)
-        # try griddap first
-        df_g, dbg_g = try_griddap_fetch(server, dataset_id, variable, lat, lon, s_iso, e_iso)
+        # 1) Try griddap without depth (fast) - this will return timeseries of surface-level variable if depth dimension exists
+        df_g, dbg_g = _try_griddap_point(server, dataset_id, variable, s_iso, e_iso, lat, lon, depth=None, timeout=timeout)
         debug.extend(dbg_g)
         if not df_g.empty:
             all_dfs.append(df_g)
             continue
-        # fallback to tabledap
-        df_t, dbg_t = try_tabledap_fetch(server, dataset_id, variable, lat, lon, s_iso, e_iso)
+        # 2) Try tabledap (profiles)
+        df_t, dbg_t = _try_tabledap(server, dataset_id, variable, s_iso, e_iso, lat, lon, timeout=timeout)
         debug.extend(dbg_t)
         if not df_t.empty:
             all_dfs.append(df_t)
-
+            continue
+        # 3) Try griddap requesting a shallow depth of 0 if present
+        df_gd, dbg_gd = _try_griddap_point(server, dataset_id, variable, s_iso, e_iso, lat, lon, depth=0, timeout=timeout)
+        debug.extend(dbg_gd)
+        if not df_gd.empty:
+            all_dfs.append(df_gd)
+            continue
+        # nothing found for this chunk
     if not all_dfs:
         return pd.DataFrame(), debug
     df_all = pd.concat(all_dfs, ignore_index=True, sort=False)
-    if "time" in df_all.columns:
-        df_all = df_all.sort_values("time").reset_index(drop=True)
+    if 'time' in df_all.columns:
+        df_all = df_all.sort_values('time').reset_index(drop=True)
     return df_all, debug
 
-
 # -------------------------
-# Plot generation + HTML output
+# Plotting: timeseries, profile heatmap, map
 # -------------------------
-def timeseries_plot(df: pd.DataFrame):
-    """Return a Plotly Figure for the main timeseries (if available)."""
-    if df.empty:
-        return go.Figure().update_layout(title="No data available")
-    data_cols = [c for c in df.columns if c.lower() not in ("time", "latitude", "longitude")]
-    varcol = data_cols[0] if data_cols else None
-    if not varcol or "time" not in df.columns:
-        return go.Figure().update_layout(title="No timeseries variable found")
-    fig = px.line(df, x="time", y=varcol, title=f"Timeseries: {varcol}")
+def plot_timeseries(df, varcol, title=None):
+    if df.empty or varcol not in df.columns or 'time' not in df.columns:
+        return go.Figure().update_layout(title="No timeseries available")
+    fig = px.line(df, x='time', y=varcol, title=title or f"Timeseries: {varcol}")
     fig.update_xaxes(rangeslider_visible=True)
     return fig
 
-
-def map_scatter_plot(df: pd.DataFrame):
-    """Return a Plotly geo scatter for the latest point if lat/lon available."""
-    if df.empty or "latitude" not in df.columns or "longitude" not in df.columns or "time" not in df.columns:
-        return go.Figure().update_layout(title="No spatial data")
-    latest_idx = df["time"].idxmax()
-    df_latest = df.loc[[latest_idx]]
-    data_cols = [c for c in df.columns if c.lower() not in ("time", "latitude", "longitude")]
-    varcol = data_cols[0] if data_cols else None
-    if varcol:
-        fig = px.scatter_geo(df_latest, lat="latitude", lon="longitude", hover_name=varcol, hover_data=["time"], title=f"Latest: {varcol}")
-    else:
-        fig = px.scatter_geo(df_latest, lat="latitude", lon="longitude", hover_data=["time"], title="Latest location")
+def plot_profile_heatmap(df, varcol, title=None):
+    """
+    If DataFrame contains 'time' and 'depth', pivot to time x depth matrix.
+    Depth axis is shown increasing downward (so we flip y axis).
+    """
+    if df.empty or varcol not in df.columns or 'time' not in df.columns or 'depth' not in df.columns:
+        return go.Figure().update_layout(title="No profile/heatmap available")
+    # pivot
+    pivot = df.pivot_table(index='depth', columns='time', values=varcol, aggfunc='mean')
+    # sort depth ascending (surface small -> top)
+    pivot = pivot.sort_index(ascending=True)
+    z = pivot.values
+    x = [str(t) for t in pivot.columns]
+    y = list(pivot.index)
+    fig = go.Figure(data=go.Heatmap(x=x, y=y, z=z, colorbar=dict(title=varcol)))
+    fig.update_layout(title=title or f"Depth-Time heatmap ({varcol})", yaxis=dict(autorange='reversed'))
     return fig
 
+def plot_profile_scatter(df, varcol, title=None):
+    """
+    If only single time or user wants a profile: depth vs var scatter/line
+    """
+    if df.empty or varcol not in df.columns or 'depth' not in df.columns:
+        return go.Figure().update_layout(title="No profile available")
+    # group by depth (mean) to produce a single profile
+    prof = df.groupby('depth')[varcol].mean().reset_index().sort_values('depth')
+    fig = px.line(prof, x=varcol, y='depth', title=title or f"Vertical profile ({varcol})", markers=True)
+    fig.update_yaxes(autorange='reversed')
+    return fig
 
-def make_html_output(df: pd.DataFrame, variable_label: str, output_filename: str = "erddap_output.html"):
-    """
-    Create an HTML file with Plotly charts and a styled data table (Bootstrap).
-    Returns output_filename.
-    """
-    figs = []
-    if df.empty:
-        figs.append(go.Figure().update_layout(title="No data available"))
-        html_table = "<p>No data returned for this query.</p>"
+def plot_map_latest(df, varcol, title=None):
+    if df.empty or 'latitude' not in df.columns or 'longitude' not in df.columns:
+        return go.Figure().update_layout(title="No spatial data")
+    if varcol not in df.columns:
+        hover = ['time']
     else:
-        fig_ts = timeseries_plot(df)
-        figs.append(fig_ts)
-        fig_map = map_scatter_plot(df)
-        figs.append(fig_map)
-        # create a styled table using pandas Styler with Bootstrap classes
-        try:
-            df_display = df.copy()
-            # round numeric columns for display
-            for c in df_display.select_dtypes(include=["float", "int"]).columns:
-                df_display[c] = df_display[c].round(6)
-            styler = df_display.style.hide_index().set_table_attributes('class="table table-striped"') \
-                .set_caption(f"Data table (rows: {len(df_display)})")
-            html_table = styler.render()
-        except Exception:
-            html_table = df.head(200).to_html(index=False)
+        hover = [varcol, 'time']
+    # take latest time row
+    if 'time' in df.columns:
+        latest_idx = df['time'].idxmax()
+        df_latest = df.loc[[latest_idx]]
+    else:
+        df_latest = df.head(1)
+    fig = px.scatter_geo(df_latest, lat='latitude', lon='longitude', hover_name=varcol if varcol in df_latest.columns else None,
+                         hover_data=hover, title=title or "Latest data location")
+    return fig
 
-    # Build HTML fragments for each figure
-    fragments = [pio.to_html(fig, include_plotlyjs=False, full_html=False) for fig in figs]
-
-    html_head = """<!doctype html><html><head><meta charset="utf-8"/>
-    <title>ERDDAP Output</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <style>body{margin:20px;font-family:Segoe UI,Roboto,Arial;background:#f7f7f7;} .card{margin-bottom:1rem;}</style>
-    </head><body><div class="container"><h2>ERDDAP Query Results</h2>"""
-    html_tail = """<hr/><p>Generated by erddap_integration.py</p></div></body></html>"""
-
-    body = []
+# -------------------------
+# HTML report with Plotly + styled table
+# -------------------------
+def render_html_report(output_filename, figures, df_table, caption="ERDDAP Results"):
+    """
+    figures: list of Plotly figures (will be embedded)
+    df_table: pandas DataFrame (display)
+    """
+    fragments = []
+    for fig in figures:
+        fragments.append(pio.to_html(fig, include_plotlyjs=False, full_html=False))
+    # styled table via pandas Styler
+    try:
+        df_disp = df_table.copy()
+        for c in df_disp.select_dtypes(include=["float64", "int64"]).columns:
+            df_disp[c] = df_disp[c].round(4)
+        styler = df_disp.style.hide_index().set_table_attributes('class="table table-striped"') \
+            .set_caption(caption)
+        html_table = styler.render()
+    except Exception:
+        html_table = df_table.to_html(index=False)
+    html_doc = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>ERDDAP Report</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>body{{margin:20px;font-family:Segoe UI, Roboto, Arial; background:#f8f9fa}} .card{{margin-bottom:1rem}}</style>
+</head><body><div class="container"><h2>{html.escape(caption)}</h2>
+"""
     for frag in fragments:
-        body.append(f'<div class="card"><div class="card-body">{frag}</div></div>')
-    body.append(f'<div class="card"><div class="card-body"><h5>Data table</h5>{html_table}</div></div>')
-    html_all = html_head + "\n".join(body) + html_tail
-
+        html_doc += f'<div class="card"><div class="card-body">{frag}</div></div>\n'
+    html_doc += f'<div class="card"><div class="card-body"><h5>Data table</h5>{html_table}</div></div>\n'
+    html_doc += '<hr/><p>Generated by erddap_integration.py</p></div></body></html>'
     with open(output_filename, "w", encoding="utf-8") as f:
-        f.write(html_all)
-    logger.info("Wrote output HTML to %s", output_filename)
+        f.write(html_doc)
     return output_filename
 
-
 # -------------------------
-# Streamlit & Flask helpers (lazy imports)
+# Streamlit widget (optional)
 # -------------------------
-def erddap_streamlit_widget(server: str = ERDDAP_SERVER):
-    """
-    Streamlit widget to embed in a Streamlit app.
-    Call this function from inside a streamlit app (after `import streamlit as st`).
-    """
+def erddap_streamlit_widget(server=ERDDAP_SERVER):
     try:
         import streamlit as st
     except Exception:
-        logger.error("Streamlit not installed; erddap_streamlit_widget requires streamlit.")
+        print("Streamlit not installed.")
         return
-
-    st.sidebar.header("ERDDAP Ocean Data")
+    st.sidebar.header("ERDDAP 3D Query")
     var_choice = st.sidebar.selectbox("Variable", ["Temperature", "Salinity", "Chlorophyll"])
     place = st.sidebar.text_input("Place (e.g., 'Honolulu, Hawaii')")
     manual_latlon = st.sidebar.text_input("Or lat,lon (e.g., '21.3,-157.8')")
-    month_year = st.sidebar.text_input("Month-Year (MM-YYYY) optional", placeholder="08-2025")
+    month_year = st.sidebar.text_input("Month-Year (MM-YYYY) optional")
     server_input = st.sidebar.text_input("ERDDAP server", value=server)
-
-    if st.sidebar.button("Fetch Data"):
-        # Resolve lat/lon
+    if st.sidebar.button("Fetch"):
         latlon = None
         if manual_latlon:
             try:
-                lat, lon = [float(p.strip()) for p in manual_latlon.split(",")]
-                latlon = (lat, lon)
+                p = [x.strip() for x in manual_latlon.split(',')]
+                latlon = (float(p[0]), float(p[1]))
             except Exception:
-                st.error("Invalid lat,lon format. Use 'lat,lon'")
+                st.error("Invalid lat,lon")
                 return
         elif place:
             with st.spinner("Geocoding..."):
                 latlon = geocode_place(place)
                 if not latlon:
-                    st.error("Geocoding failed.")
+                    st.error("Geocoding failed")
                     return
         else:
-            st.warning("Provide a place or lat,lon.")
+            st.warning("Provide a place or lat,lon")
             return
-
         lat, lon = latlon
-
-        # Resolve time
+        # time range
         if month_year:
             try:
-                m, y = [int(x) for x in month_year.split("-")]
+                m, y = map(int, month_year.split('-'))
                 _, last_day = calendar.monthrange(y, m)
                 start_dt = datetime(y, m, 1, tzinfo=timezone.utc)
                 end_dt = datetime(y, m, last_day, 23, 59, 59, tzinfo=timezone.utc)
             except Exception:
-                st.error("Invalid Month-Year format. Use MM-YYYY.")
+                st.error("Invalid Month-Year format")
                 return
         else:
             end_dt = datetime.now(timezone.utc)
             start_dt = end_dt - timedelta(days=30)
-
-        st.info(f"Discovering dataset for {var_choice} on {server_input} ...")
-        ds_id, var_guess, note = discover_dataset(server_input, var_choice)
+        st.info(f"Fetching {var_choice} for {lat:.3f},{lon:.3f} between {_format_iso(start_dt)} and {_format_iso(end_dt)}")
+        # Discover dataset heuristics (simple)
+        heuristics = {
+            "Temperature": (["sea surface temperature", "sst"], ["analysed_sst","sea_surface_temperature","sst","temperature"]),
+            "Salinity": (["salinity", "sss"], ["salinity","sea_surface_salinity","sss"]),
+            "Chlorophyll": (["chlorophyll", "chlor a", "chl"], ["chlor_a","chl","CHL_Weekly","chlorophyll"])
+        }
+        search_terms, var_keywords = heuristics[var_choice]
+        with st.spinner("Searching for dataset..."):
+            ds_id, var_guess, note = discover_dataset(server_input, var_choice, search_terms, var_keywords, curated_fallback=None)
         if not ds_id:
-            st.error("No valid dataset found: " + note)
+            st.error("No dataset found: " + note)
             return
-
-        st.write(f"Using dataset: `{ds_id}` (variable guess: `{var_guess}`)")
+        st.write("Dataset:", ds_id, "Var guess:", var_guess)
         with st.spinner("Fetching data..."):
-            df, debug = fetch_point_timeseries(server_input, ds_id, var_guess, lat, lon, start_dt, end_dt)
-
+            df, debug = fetch_with_3d_support(server_input, ds_id, var_guess, lat, lon, start_dt, end_dt)
         if df.empty:
-            st.error("No data returned. See debug info below.")
-            st.subheader("Debug attempts")
-            for url, snippet in debug[:10]:
-                st.markdown(f"**URL:** `{url}`")
-                st.code(snippet[:1000])
+            st.error("No data returned. Show debug attempts below.")
+            st.write(debug[:6])
             return
+        # Determine variable column
+        data_cols = [c for c in df.columns if c.lower() not in ['time','latitude','longitude','depth']]
+        varcol = data_cols[0] if data_cols else None
+        st.plotly_chart(plot_timeseries(df, varcol), use_container_width=True)
+        if 'depth' in df.columns:
+            # heatmap
+            st.plotly_chart(plot_profile_heatmap(df, varcol), use_container_width=True)
+            st.plotly_chart(plot_profile_scatter(df, varcol), use_container_width=True)
+        st.plotly_chart(plot_map_latest(df, varcol), use_container_width=True)
+        st.write("Data sample:")
+        st.dataframe(df.head(50))
 
-        st.subheader("Timeseries")
-        st.plotly_chart(timeseries_plot(df), use_container_width=True)
-
-        st.subheader("Latest point on map")
-        st.plotly_chart(map_scatter_plot(df), use_container_width=True)
-
-        st.subheader("Data table")
-        # show pandas dataframe in streamlit
-        st.dataframe(df.head(200))
-
-        # allow saving to HTML
-        if st.button("Save interactive HTML"):
-            out = make_html_output(df, var_guess or var_choice, output_filename="erddap_output.html")
-            st.success(f"Saved to {out}")
-
-
-def register_erddap_blueprint(app, server: str = ERDDAP_SERVER):
-    """
-    Register a Flask blueprint at /erddap that provides a simple form and renders
-    Plotly figures inline.
-    """
+# -------------------------
+# Flask blueprint (optional)
+# -------------------------
+def register_erddap_blueprint(app, server=ERDDAP_SERVER):
     try:
         from flask import Blueprint, request, render_template_string
     except Exception:
-        logger.error("Flask not installed; cannot register blueprint.")
+        print("Flask not available.")
         return
-
-    bp = Blueprint("erddap_integration", __name__)
-    FORM_HTML = """
-    <!doctype html><html><head><meta charset="utf-8">
+    bp = Blueprint('erddap3d', __name__)
+    HTML = """
+    <!doctype html><html><head><title>ERDDAP 3D Query</title>
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <style>body{font-family:sans-serif;padding:1rem;} .card{margin-bottom:1rem;}</style>
-    </head><body>
-    <h3>ERDDAP Query</h3>
+    <style>body{font-family:sans-serif;padding:2em;}</style></head><body>
+    <h3>ERDDAP 3D Query</h3>
     <form method="post">
-      Variable:
-      <select name="variable">
-        {% for v in variables %}
-          <option value="{{v}}" {% if v==selected_var %}selected{% endif %}>{{v}}</option>
-        {% endfor %}
-      </select><br>
-      Place name: <input name="place" value="{{place}}"><br>
+      Variable: <select name="variable">{% for v in variables %}<option value="{{v}}">{{v}}</option>{% endfor %}</select><br>
+      Place: <input name="place" value="{{place}}"><br>
       Or lat,lon: <input name="latlon" value="{{latlon}}"><br>
       Month-Year (MM-YYYY): <input name="month_year" value="{{month_year}}"><br>
       <button type="submit">Fetch</button>
     </form>
-    <div id="info">{{info|safe}}</div>
-    <div id="charts">{{charts|safe}}</div>
+    <div id="output">{{output|safe}}</div>
     </body></html>
     """
-
-    @bp.route("/erddap", methods=["GET", "POST"])
-    def erddap_form():
-        info_html = ""
-        charts_html = ""
-        form_data = {"variables": ["Temperature", "Salinity", "Chlorophyll"],
-                     "selected_var": "Temperature", "place": "", "latlon": "", "month_year": ""}
-        if request.method == "POST":
-            var_choice = request.form.get("variable")
-            place = request.form.get("place", "").strip()
-            manual_latlon = request.form.get("latlon", "").strip()
-            month_year = request.form.get("month_year", "").strip()
-            form_data.update({"selected_var": var_choice, "place": place, "latlon": manual_latlon, "month_year": month_year})
-
-            # Resolve location
-            latlon = None
-            if manual_latlon:
+    @bp.route('/erddap3d', methods=['GET','POST'])
+    def form():
+        output = ""
+        form = {'variables': ['Temperature','Salinity','Chlorophyll'], 'place':'','latlon':'','month_year':''}
+        if request.method == 'POST':
+            var_choice = request.form.get('variable')
+            place = request.form.get('place','').strip()
+            latlon = request.form.get('latlon','').strip()
+            month_year = request.form.get('month_year','').strip()
+            form.update({'place':place, 'latlon':latlon, 'month_year':month_year})
+            # resolve coords
+            coords = None
+            if latlon:
                 try:
-                    lat, lon = [float(x.strip()) for x in manual_latlon.split(",")]
-                    latlon = (lat, lon)
+                    p = [x.strip() for x in latlon.split(',')]
+                    coords = (float(p[0]), float(p[1]))
                 except Exception:
-                    info_html = "<p style='color:red;'>Invalid lat,lon format.</p>"
-                    return render_template_string(FORM_HTML, **form_data, info=info_html, charts=charts_html)
+                    output = "<p style='color:red;'>Invalid lat,lon</p>"
+                    return render_template_string(HTML, output=output, **form)
             elif place:
-                latlon = geocode_place(place)
-                if not latlon:
-                    info_html = "<p style='color:red;'>Geocoding failed.</p>"
-                    return render_template_string(FORM_HTML, **form_data, info=info_html, charts=charts_html)
+                coords = geocode_place(place)
+                if not coords:
+                    output = "<p style='color:red;'>Geocoding failed</p>"
+                    return render_template_string(HTML, output=output, **form)
             else:
-                info_html = "<p style='color:orange;'>Provide a place or lat,lon.</p>"
-                return render_template_string(FORM_HTML, **form_data, info=info_html, charts=charts_html)
-
-            lat, lon = latlon
-
-            # Resolve time
+                output = "<p style='color:orange;'>Provide place or lat,lon</p>"
+                return render_template_string(HTML, output=output, **form)
+            lat, lon = coords
+            # time range
             if month_year:
                 try:
-                    m, y = [int(x) for x in month_year.split("-")]
-                    _, last_day = calendar.monthrange(y, m)
-                    start_dt = datetime(y, m, 1, tzinfo=timezone.utc)
-                    end_dt = datetime(y, m, last_day, 23, 59, 59, tzinfo=timezone.utc)
+                    m,y = map(int, month_year.split('-'))
+                    _, last = calendar.monthrange(y,m)
+                    start_dt = datetime(y,m,1,tzinfo=timezone.utc)
+                    end_dt = datetime(y,m,last,23,59,59,tzinfo=timezone.utc)
                 except Exception:
-                    info_html = "<p style='color:red;'>Invalid Month-Year format.</p>"
-                    return render_template_string(FORM_HTML, **form_data, info=info_html, charts=charts_html)
+                    output = "<p style='color:red;'>Invalid month-year format</p>"
+                    return render_template_string(HTML, output=output, **form)
             else:
                 end_dt = datetime.now(timezone.utc)
                 start_dt = end_dt - timedelta(days=30)
-
-            # Discover dataset and fetch
-            ds_id, var_guess, note = discover_dataset(server, var_choice)
+            heuristics = {
+                "Temperature": (["sea surface temperature","sst"], ["analysed_sst","sea_surface_temperature","sst","temperature"]),
+                "Salinity": (["salinity","sss"], ["salinity","sea_surface_salinity","sss"]),
+                "Chlorophyll": (["chlorophyll","chl"], ["chlor_a","chl","CHL_Weekly","chlorophyll"])
+            }
+            search_terms, var_keywords = heuristics[var_choice]
+            ds_id, var_guess, note = discover_dataset(server, var_choice, search_terms, var_keywords)
             if not ds_id:
-                info_html = f"<p style='color:red;'>No dataset found: {note}</p>"
-                return render_template_string(FORM_HTML, **form_data, info=info_html, charts=charts_html)
-
-            df, debug = fetch_point_timeseries(server, ds_id, var_guess, lat, lon, start_dt, end_dt)
+                output = f"<p style='color:red;'>No dataset found: {html.escape(note)}</p>"
+                return render_template_string(HTML, output=output, **form)
+            df, debug = fetch_with_3d_support(server, ds_id, var_guess, lat, lon, start_dt, end_dt)
             if df.empty:
-                info_html = "<p style='color:red;'>No data returned. See debug above.</p>"
-                dbg_html = "<pre>" + html.escape("\n".join(u for u, _ in debug[:10])) + "</pre>"
-                charts_html = dbg_html
-            else:
-                fig_ts = timeseries_plot(df)
-                fig_map = map_scatter_plot(df)
-                # embed two plots; use Plotly JSON for safety
-                plots_js = f"<div id='plot1'></div><div id='plot2'></div><script>Plotly.newPlot('plot1', {fig_ts.to_json()});Plotly.newPlot('plot2', {fig_map.to_json()});</script>"
-                # minimal table
-                table_html = df.head(200).to_html(index=False)
-                charts_html = plots_js + "<h4>Data sample</h4>" + table_html
-
-        return render_template_string(FORM_HTML, **form_data, info=info_html, charts=charts_html)
-
+                output = "<p style='color:red;'>No data returned; see debug attempts:</p><pre>"
+                for u,s in debug[:8]:
+                    output += html.escape(u) + "\n" + html.escape(str(s)[:300]) + "\n\n"
+                output += "</pre>"
+                return render_template_string(HTML, output=output, **form)
+            data_cols = [c for c in df.columns if c.lower() not in ['time','latitude','longitude','depth']]
+            varcol = data_cols[0] if data_cols else None
+            fig_ts = plot_timeseries(df, varcol)
+            figs_html = pio.to_html(fig_ts, include_plotlyjs=False, full_html=False)
+            output = figs_html
+        return render_template_string(HTML, output=output, **form)
     app.register_blueprint(bp)
 
-
 # -------------------------
-# CLI helpers & entrypoint
+# CLI entrypoint
 # -------------------------
 def build_argparser():
-    p = argparse.ArgumentParser(prog="erddap_integration.py")
+    p = argparse.ArgumentParser(prog="erddap_integration.py", description="ERDDAP 3D integration CLI")
     p.add_argument("--server", default=ERDDAP_SERVER, help="ERDDAP server URL")
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--place", type=str, help="Place name")
-    group.add_argument("--latlon", type=str, help="Manual lat,lon (e.g., '21.3,-157.8')")
-    p.add_argument("--month-year", dest="month_year", type=str, help="MM-YYYY optional")
-    p.add_argument("--var-friendly", dest="var_friendly", choices=["Temperature", "Salinity", "Chlorophyll"], default="Temperature")
-    p.add_argument("--output", dest="output", default="erddap_output.html", help="Output HTML filename")
+    loc_group = p.add_mutually_exclusive_group(required=True)
+    loc_group.add_argument("--place", type=str, help="Place name")
+    loc_group.add_argument("--latlon", type=str, help="lat,lon")
+    p.add_argument("--month-year", dest="month_year", type=str, help="MM-YYYY")
+    p.add_argument("--var-friendly", dest="var_friendly", choices=["Temperature","Salinity","Chlorophyll"], default="Temperature")
+    p.add_argument("--output", dest="output", default="erddap_report.html")
+    p.add_argument("--timeout", dest="timeout", type=int, default=30)
     return p
-
 
 def main():
     parser = build_argparser()
     args = parser.parse_args()
-
-    # Resolve lat/lon
-    latlon = None
+    server = args.server.rstrip('/')
+    # resolve coords
     if args.latlon:
         try:
-            lat, lon = [float(x.strip()) for x in args.latlon.split(",")]
-            latlon = (lat, lon)
+            lat_s, lon_s = args.latlon.split(',')
+            lat, lon = float(lat_s.strip()), float(lon_s.strip())
         except Exception:
-            logger.error("Invalid --latlon format. Use lat,lon")
+            print("Invalid --latlon format. Use: lat,lon")
             sys.exit(2)
-    elif args.place:
-        logger.info("Geocoding '%s'...", args.place)
-        latlon = geocode_place(args.place)
-    if not latlon:
-        logger.error("Could not resolve location.")
-        sys.exit(3)
-    lat, lon = latlon
-    logger.info("Using coordinates: %s, %s", lat, lon)
-
-    # Resolve time range
+    else:
+        geo = geocode_place(args.place)
+        if not geo:
+            print("Geocoding failed for place:", args.place)
+            sys.exit(3)
+        lat, lon = geo
+    print(f"Using coordinates: {lat:.6f}, {lon:.6f}")
+    # time range
     if args.month_year:
         try:
-            m, y = [int(x) for x in args.month_year.split("-")]
-            _, last_day = calendar.monthrange(y, m)
+            mm, yy = args.month_year.split('-')
+            m, y = int(mm), int(yy)
+            _, last = calendar.monthrange(y, m)
             start_dt = datetime(y, m, 1, tzinfo=timezone.utc)
-            end_dt = datetime(y, m, last_day, 23, 59, 59, tzinfo=timezone.utc)
+            end_dt = datetime(y, m, last, 23, 59, 59, tzinfo=timezone.utc)
         except Exception:
-            logger.error("Invalid --month-year. Use MM-YYYY")
+            print("Invalid --month-year. Use MM-YYYY")
             sys.exit(4)
     else:
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=30)
-
-    server = args.server.rstrip("/")
-    friendly = args.var_friendly
-    logger.info("Discovering dataset for %s on %s", friendly, server)
-    ds_id, var_guess, note = discover_dataset(server, friendly)
+    print("Time range:", _format_iso(start_dt), "to", _format_iso(end_dt))
+    heuristics = {
+        "Temperature": (["sea surface temperature", "sst"], ["analysed_sst","sea_surface_temperature","sst","temperature"]),
+        "Salinity": (["salinity", "sss"], ["salinity","sea_surface_salinity","sss"]),
+        "Chlorophyll": (["chlorophyll", "chl"], ["chlor_a","chl","CHL_Weekly","chlorophyll"])
+    }
+    search_terms, var_keywords = heuristics[args.var_friendly]
+    print("Discovering datasets...")
+    ds_id, var_guess, note = discover_dataset(server, args.var_friendly, search_terms, var_keywords,
+                                              curated_fallback=None)
     if not ds_id:
-        logger.error("No validated dataset found: %s", note)
+        print("No dataset found automatically. Aborting. Note:", note)
         sys.exit(5)
-    logger.info("Using dataset %s (var guess: %s)", ds_id, var_guess)
-
-    df, debug = fetch_point_timeseries(server, ds_id, var_guess, lat, lon, start_dt, end_dt)
+    print("Chosen dataset:", ds_id, "variable guess:", var_guess)
+    print("Fetching data...")
+    df, debug = fetch_with_3d_support(server, ds_id, var_guess, lat, lon, start_dt, end_dt, timeout=args.timeout)
     if df.empty:
-        logger.warning("No data returned. Writing debug HTML.")
-        debug_html = "<h3>No data returned</h3><ul>"
-        for u, s in debug:
-            debug_html += f"<li><pre>{html.escape(u)}\n{html.escape(str(s)[:400])}</pre></li>"
-        debug_html += "</ul>"
+        print("No data returned. Debug attempts (sample):")
+        for u,s in debug[:8]:
+            print("-", u)
+        # write debug HTML for inspection
+        html_blob = "<h3>No data returned</h3><ul>"
+        for u,s in debug:
+            html_blob += "<li><pre>" + html.escape(u) + "\n" + html.escape(str(s)[:400]) + "</pre></li>"
+        html_blob += "</ul>"
         with open(args.output, "w", encoding="utf-8") as f:
-            f.write(f"<!doctype html><html><body>{debug_html}</body></html>")
-        logger.info("Wrote debug output to %s", args.output)
+            f.write(f"<!doctype html><html><body>{html_blob}</body></html>")
+        print("Wrote debug HTML to", args.output)
         sys.exit(0)
-
-    out = make_html_output(df, var_guess or friendly, output_filename=args.output)
-    logger.info("Saved interactive HTML to: %s", out)
-    logger.info("Open the file in a browser to view charts and table.")
-
+    # pick variable column
+    data_cols = [c for c in df.columns if c.lower() not in ['time','latitude','longitude','depth']]
+    varcol = data_cols[0] if data_cols else None
+    figs = []
+    figs.append(plot_timeseries(df, varcol, title=f"Timeseries ({varcol or 'value'})"))
+    if 'depth' in df.columns:
+        # heatmap
+        figs.append(plot_profile_heatmap(df, varcol, title=f"Depth-Time ({varcol})"))
+        figs.append(plot_profile_scatter(df, varcol, title=f"Profile ({varcol})"))
+    figs.append(plot_map_latest(df, varcol, title="Latest Location"))
+    out = render_html_report(args.output, figs, df, caption=f"ERDDAP: {ds_id} ({varcol or 'value'})")
+    print("Saved report to", out)
+    print("Done.")
 
 if __name__ == "__main__":
     main()
