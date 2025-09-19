@@ -1,36 +1,10 @@
-"""
-ERDDAP integration helper for floatchat/app.py
-
-USAGE (paste these lines into your repo):
-1) Create a new file at the root of the project: `erddap_integration.py` and paste this whole file there.
-2) Install required packages if not present:
-   pip install pandas requests plotly geopy
-
-3a) If your app is a Streamlit app: open app.py and *only* add the following two lines near the top (after other imports):
-   from erddap_integration import erddap_streamlit_widget
-
-   And then inside your main UI rendering function (where the Streamlit widgets live), add a single call:
-   erddap_streamlit_widget()
-
-3b) If your app is a Flask (or other WSGI) app: add these two lines near app initialization:
-   from erddap_integration import register_erddap_blueprint
-   register_erddap_blueprint(app)
-
-IMPORTANT: This module only *adds* new functions/routes/UI. It does not modify any of your existing functions.
-
-This file is a corrected and more robust version of the helper you provided. It contains:
- - fixes for indentation and URL/time formatting bugs
- - safer dataset/variable probing using the dataset index CSV
- - attempts with both lat/lon ordering when fetching griddap data
- - normalization of common lat/lon/time column names
- - clearer debug output when fetch fails
-
-If you want further customization (e.g. support for tabledap-only datasets, or more permissive variable name matching), tell me which datasets you use and I'll tune it.
-"""
-
+# erddap_integration.py
+# Clean, robust ERDDAP helper + small CLI that prints friendly output (no error logs).
 from datetime import datetime, timedelta
 import io
 import re
+import argparse
+import sys
 import requests
 import pandas as pd
 import plotly.express as px
@@ -43,39 +17,42 @@ try:
 except Exception:
     GEOPY_AVAILABLE = False
 
-ERDDAP_SERVER = "https://coastwatch.pfeg.noaa.gov/erddap"
+# Use NOAA CoastWatch ERDDAP as the default (this is a generally available NOAA host)
+ERDDAP_SERVER = "https://coastwatch.noaa.gov/erddap"
 # small bbox half-width (deg) to capture nearest grid cell
 BBOX_HALF_DEG = 0.125
 
 
-def get_dataset_variables(server, dataset_id, timeout=20):
+def get_dataset_variables(server, dataset_id, timeout=8):
     """
     Query ERDDAP info page CSV for a dataset and return a list of variable names (destination names).
-    Returns list of strings (may be empty) or raises on network errors.
+    Returns list of strings (may be empty). Failures return empty list (no exception raised).
     """
     try:
         url = f"{server}/info/{dataset_id}/index.csv"
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
-        # Look for a column that contains variable/Variable name
+        # Look for a column that contains variable/Variable name or destinationName
         cols = [c for c in df.columns if 'variable' in c.lower() and 'name' in c.lower()]
         if not cols:
-            # often the index.csv has a column 'Variable Name' or 'destinationName'
-            cols = [c for c in df.columns if 'destination' in c.lower()]
+            cols = [c for c in df.columns if 'destination' in c.lower() or 'destinationname' in c.lower()]
         if not cols:
+            # fallback: try to detect variable rows by 'Row Type' == 'variable'
+            if 'Row Type' in df.columns:
+                vars_df = df[df['Row Type'].astype(str).str.lower() == 'variable']
+                if 'Variable Name' in vars_df.columns:
+                    return vars_df['Variable Name'].dropna().astype(str).unique().tolist()
             return []
         var_col = cols[0]
         vars_list = df[var_col].dropna().astype(str).unique().tolist()
         vars_list = [v.strip() for v in vars_list if v.strip() and len(v.strip()) < 200]
         return vars_list
-    except Exception as e:
-        print(f"[get_dataset_variables] failed: {e}")
+    except Exception:
         return []
 
 
 def get_preferred_for(friendly_variable):
-    """Return preferred dataset list (dataset_id, varname) for a friendly variable."""
     return PREFERRED_DATASETS.get(friendly_variable, [])
 
 
@@ -83,7 +60,6 @@ def get_preferred_for(friendly_variable):
 # Utils
 # -------------------------
 def _normalize_colname(s: str) -> str:
-    """Normalize column names to compare easily (remove non-alphanum, lower)."""
     return re.sub(r'\W+', '', str(s)).lower()
 
 
@@ -93,16 +69,15 @@ def _normalize_colname(s: str) -> str:
 def discover_erddap_datasets(server=ERDDAP_SERVER, keyword="sst", max_results=20):
     """
     Search ERDDAP server for datasets matching keyword.
-    Returns a pandas.DataFrame standardized to have columns: dataset_id, title (if available).
-    Falls back to returning the raw DataFrame if parsing fails.
+    Returns a pandas.DataFrame with columns dataset_id and optional title (if available).
+    On failure returns empty DataFrame.
     """
     try:
         q = requests.utils.requote_uri(f"{server}/search/index.csv?searchFor={keyword}&itemsPerPage={max_results}")
-        r = requests.get(q, timeout=30)
+        r = requests.get(q, timeout=20)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
 
-        # Normalize column names and look for dataset-id like columns
         col_map = { _normalize_colname(c): c for c in df.columns }
         candidates = ['datasetid', 'dataset_id', 'dataset', 'datasetname']
         dataset_col = None
@@ -124,34 +99,29 @@ def discover_erddap_datasets(server=ERDDAP_SERVER, keyword="sst", max_results=20
                 return df[['dataset_id', 'title']].drop_duplicates().reset_index(drop=True)
             return df[['dataset_id']].drop_duplicates().reset_index(drop=True)
 
-        # If we couldn't find a dataset id column, return raw df (caller will handle empty case)
-        return df
-
-    except Exception as e:
-        print("ERDDAP discover failed:", e)
+        return pd.DataFrame()
+    except Exception:
         return pd.DataFrame()
 
 
 # -------------------------
-# Helper: basic geocode (geopy optional, otherwise HTTP Nominatim)
+# Geocode helper
 # -------------------------
 def geocode_place(place):
-    """
-    Return (lat, lon) from place name. Returns None on failure.
-    """
+    """Return (lat, lon) from place name. Returns None on failure."""
     if GEOPY_AVAILABLE:
         try:
             geolocator = Nominatim(user_agent="floatchat_erddap_integration")
             loc = geolocator.geocode(place, timeout=10)
             if loc:
                 return float(loc.latitude), float(loc.longitude)
-        except Exception as e:
-            print("Geopy geocode failed:", e)
+        except Exception:
+            pass
 
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": place, "format": "json", "limit": 1, "addressdetails": 0}
-        headers = {"User-Agent": "floatchat_erddap_integration/1.0 (your_email@example.com)"}
+        headers = {"User-Agent": "floatchat_erddap_integration/1.0 (contact@example.com)"}
         r = requests.get(url, params=params, headers=headers, timeout=10)
         r.raise_for_status()
         j = r.json()
@@ -159,27 +129,19 @@ def geocode_place(place):
             lat = float(j[0].get("lat"))
             lon = float(j[0].get("lon"))
             return lat, lon
-    except Exception as e:
-        print("Geocode failed (nominatim):", e)
-
+    except Exception:
+        pass
     return None
 
 
 # -------------------------
 # Helper: fetch griddap point timeseries
 # -------------------------
-def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_date=None, days=7, start_year=None, end_year=None, debug=False):
+def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon,
+                                   end_date=None, days=30, start_year=None, end_year=None, debug=False):
     """
-    Robust fetch supporting either day-window (legacy) or year-range (preferred).
-    - If start_year and end_year are provided, uses Jan 1 start_year -> Dec 31 end_year.
-    - Otherwise uses 'days' back from end_date (legacy behaviour).
-
-    The function will:
-      * try to probe dataset / variable existence using /info/{dataset}/index.csv
-      * try a small bbox around the requested lat/lon with progressively larger bboxes
-      * attempt both lat/lon ordering variants (some datasets use lon,lat order)
-
-    Returns a DataFrame or (DataFrame, raw_texts) when debug=True.
+    Fetch griddap timeseries for a (lat,lon) point. Returns DataFrame (possibly empty).
+    If debug=True returns (df, raw_attempts).
     """
     raw_texts = []
 
@@ -196,22 +158,12 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
             end_date_obj = end_date
         start_date = end_date_obj - timedelta(days=days - 1)
 
-    # Convert to ISO strings with time to be safer for griddap
     start = start_date.isoformat() + "T00:00:00Z"
     end = end_date_obj.isoformat() + "T00:00:00Z"
 
-    # Get variable list from dataset info to know dimension ordering (best-effort)
-    try:
-        dataset_vars = get_dataset_variables(server, dataset_id)
-    except Exception:
-        dataset_vars = []
-
-    # Try multiple bbox sizes if single bbox returns empty (progressively larger)
+    # try bbox attempts
     attempt_bboxes = [BBOX_HALF_DEG, 0.25, 0.5, 1.0, 2.0]
-
-    # For some griddap datasets, dimension ordering is (time, lat, lon) or (time, lon, lat).
-    # We'll try both ordering variants.
-    orders = [ ("lat", "lon"), ("lon", "lat") ]
+    orders = [("lat","lon"), ("lon","lat")]
 
     for hb in attempt_bboxes:
         lat_min = lat - hb
@@ -220,31 +172,29 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
         lon_max = lon + hb
 
         for order in orders:
-            if order == ("lat", "lon"):
-                bounds = f"[({lat_min}):1:({lat_max})][({lon_min}):1:({lon_max})]"
+            if order == ("lat","lon"):
+                bounds = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lat_min, lat_max, lon_min, lon_max)
+                # this builds as [lat][lon]
             else:
-                # lon, lat ordering
-                bounds = f"[({lon_min}):1:({lon_max})][({lat_min}):1:({lat_max})]"
+                bounds = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lon_min, lon_max, lat_min, lat_max)
+                # this builds as [lon][lat]
 
-            url = (
-                f"{server}/griddap/{dataset_id}.csv?{variable}"
-                f"[({start}):1:({end})]"
-                f"{bounds}"
-            )
-
+            url = f"{server}/griddap/{dataset_id}.csv?{variable}[({start}):1:({end})]{bounds}"
             try:
                 r = requests.get(url, timeout=90)
-                raw_texts.append((url, r.text[:50000] if isinstance(r.text, str) else str(r.status_code)))
+                text = r.text if isinstance(r.text, str) else ''
+                raw_texts.append((url, text[:60000] if text else f"HTTP {r.status_code}"))
                 if r.status_code != 200:
                     continue
                 df = pd.read_csv(io.StringIO(r.text))
 
-                # Normalize common column names
+                # Normalize names and coerce numeric types
                 col_lower = {c.lower(): c for c in df.columns}
                 if 'time' in col_lower:
                     df.rename(columns={col_lower['time']: 'time'}, inplace=True)
                     df['time'] = pd.to_datetime(df['time'], errors='coerce')
-                # lat/lon normalization
+
+                # lat normalization
                 if 'latitude' in col_lower:
                     df.rename(columns={col_lower['latitude']: 'latitude'}, inplace=True)
                 elif 'lat' in col_lower:
@@ -252,6 +202,7 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
                 elif 'y' in col_lower:
                     df.rename(columns={col_lower['y']: 'latitude'}, inplace=True)
 
+                # lon normalization
                 if 'longitude' in col_lower:
                     df.rename(columns={col_lower['longitude']: 'longitude'}, inplace=True)
                 elif 'lon' in col_lower:
@@ -259,14 +210,17 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
                 elif 'x' in col_lower:
                     df.rename(columns={col_lower['x']: 'longitude'}, inplace=True)
 
-                # Some griddap outputs name value column as '<varname>' or '<varname>_analysis'; handle generically.
-                # If variable column is not present, pick the first non-lat/lon/time column.
-                non_geo_cols = [c for c in df.columns if c not in ['time', 'latitude', 'longitude']]
-                if not non_geo_cols:
-                    # nothing useful here
-                    continue
+                # Coerce lat/lon to numeric (safe)
+                if 'latitude' in df.columns:
+                    df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
+                if 'longitude' in df.columns:
+                    df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
 
-                # Drop rows with NaN time
+                # Convert value columns to numeric where possible
+                value_cols = [c for c in df.columns if c not in ('time', 'latitude', 'longitude')]
+                for c in value_cols:
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
+
                 if 'time' in df.columns:
                     df = df.dropna(subset=['time'])
 
@@ -274,30 +228,29 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
                     if debug:
                         return df, raw_texts
                     return df
-
             except Exception as e:
                 raw_texts.append((url, f"EXCEPTION: {e}"))
                 continue
 
-    # As a last attempt, try a single-point query (no bbox ranges) using the exact lat/lon
+    # final attempt: exact point
     for order in orders:
-        lat_q = lat
-        lon_q = lon
-        if order == ("lat", "lon"):
-            point_idx = f"[({lat_q}):1:({lat_q})][({lon_q}):1:({lon_q})]"
+        if order == ("lat","lon"):
+            point_idx = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lat, lat, lon, lon)
         else:
-            point_idx = f"[({lon_q}):1:({lon_q})][({lat_q}):1:({lat_q})]"
+            point_idx = f"[(%f):1:(%f)][(%f):1:(%f)]" % (lon, lon, lat, lat)
         url = f"{server}/griddap/{dataset_id}.csv?{variable}[({start}):1:({end})]{point_idx}"
         try:
             r = requests.get(url, timeout=90)
-            raw_texts.append((url, r.text[:50000] if isinstance(r.text, str) else str(r.status_code)))
+            text = r.text if isinstance(r.text, str) else ''
+            raw_texts.append((url, text[:60000] if text else f"HTTP {r.status_code}"))
             if r.status_code != 200:
                 continue
             df = pd.read_csv(io.StringIO(r.text))
-            if 'time' in df.columns:
-                df['time'] = pd.to_datetime(df['time'], errors='coerce')
-            # normalize lat/lon as above
+
             col_lower = {c.lower(): c for c in df.columns}
+            if 'time' in col_lower:
+                df.rename(columns={col_lower['time']: 'time'}, inplace=True)
+                df['time'] = pd.to_datetime(df['time'], errors='coerce')
             if 'latitude' in col_lower:
                 df.rename(columns={col_lower['latitude']: 'latitude'}, inplace=True)
             elif 'lat' in col_lower:
@@ -307,6 +260,16 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
             elif 'lon' in col_lower:
                 df.rename(columns={col_lower['lon']: 'longitude'}, inplace=True)
 
+            if 'latitude' in df.columns:
+                df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
+            if 'longitude' in df.columns:
+                df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+            value_cols = [c for c in df.columns if c not in ('time', 'latitude', 'longitude')]
+            for c in value_cols:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+
+            if 'time' in df.columns:
+                df = df.dropna(subset=['time'])
             if not df.empty:
                 if debug:
                     return df, raw_texts
@@ -315,30 +278,25 @@ def fetch_griddap_point_timeseries(server, dataset_id, variable, lat, lon, end_d
             raw_texts.append((url, f"EXCEPTION: {e}"))
             continue
 
-    # If we reached here, no data found in any bbox attempt
+    # nothing found
     if debug:
         return pd.DataFrame(), raw_texts
     return pd.DataFrame()
 
 
 # -------------------------
-# Helper: choose dataset & variable mapping
+# Variable mappings & preferences
 # -------------------------
-# Friendly variable -> search keywords and common variable names to try
 DEFAULT_VARIABLES = {
-    'Temperature': {'search_kw': 'sst OR sea surface temperature OR sea_surface_temperature', 'var_names': ['sst', 'analysed_sst', 'sea_surface_temperature', 'temperature']},
+    'Temperature': {'search_kw': 'sst OR sea surface temperature OR sea_surface_temperature', 'var_names': ['sea_surface_temperature', 'sst', 'analysed_sst', 'temperature']},
     'Salinity': {'search_kw': 'salinity OR sss OR sea surface salinity', 'var_names': ['sss', 'salinity', 'sea_surface_salinity']},
     'Chlorophyll': {'search_kw': 'chlorophyll OR chlor_a', 'var_names': ['chlor_a', 'chlorophyll', 'chl']},
 }
 
-# ---------- Preferred datasets for common project needs ----------
-# These are examples that tend to exist on many ERDDAP servers. If a server uses different IDs,
-# you can override using the Streamlit override input box.
 PREFERRED_DATASETS = {
     'Temperature': [
-        # NOAA OISST / AVHRR style datasets (dataset ids vary across ERDDAP servers)
-        ('ncdcOisst', 'sst'),
-        ('ncdc_oisst_v2_avhrr_by_time_zlev_lat_lon', 'sst'),
+        ('noaacwLEOACSPOSSTL3SnrtCDaily', 'sea_surface_temperature'),
+        ('jplMURSST41', 'analysed_sst'),
     ],
     'Salinity': [
         ('NCOM_amseas_latest3d', 'salinity'),
@@ -351,74 +309,56 @@ PREFERRED_DATASETS = {
 
 def pick_dataset_and_var(server, friendly_variable):
     """
-    Try to discover a dataset and a plausible variable name for the friendly_variable.
-    Returns (dataset_id, variable_name) or (None, None).
-
-    Strategy:
-      1. Try the PREFERRED_DATASETS list for the friendly variable (quick "probe" by reading index.csv)
-      2. If not found, run discover_erddap_datasets() and probe the first few returned datasets
-      3. Use get_dataset_variables() to check for available variable names and choose a best match
+    Return (dataset_id, variable_name) or (None, None).
+    Uses PREFERRED_DATASETS first then discovery on server.
     """
-    # guard
     if friendly_variable not in DEFAULT_VARIABLES:
         return None, None
-
     info = DEFAULT_VARIABLES[friendly_variable]
 
-    # 1) Try preferred datasets first
+    # try preferred
     prefs = PREFERRED_DATASETS.get(friendly_variable, [])
     for ds_id, varname in prefs:
-        try:
-            vars_list = get_dataset_variables(server, ds_id)
-            if not vars_list:
-                continue
-            # Normalize names and check if requested variable exists
-            vars_lower = [v.lower() for v in vars_list]
-            if varname.lower() in vars_lower:
-                return ds_id, varname
-            # also accept any of our candidate alternative var names
-            for candidate in info['var_names']:
-                if candidate.lower() in vars_lower:
-                    return ds_id, candidate
-        except Exception:
+        vars_list = get_dataset_variables(server, ds_id)
+        if not vars_list:
             continue
+        vs = [v.lower() for v in vars_list]
+        if varname.lower() in vs:
+            # return case-preserved var name from list
+            matched = [v for v in vars_list if v.lower() == varname.lower()][0]
+            return ds_id, matched
+        for candidate in info['var_names']:
+            for v in vars_list:
+                if v.lower() == candidate.lower():
+                    return ds_id, v
 
-    # 2) Discover datasets via search
+    # discover
     df = discover_erddap_datasets(server, info['search_kw'])
     if df.empty:
-        # try simpler keyword
         df = discover_erddap_datasets(server, friendly_variable.lower())
     if df.empty:
         return None, None
 
-    # Probe top N discovered datasets to find a matching variable
     probe_n = min(6, len(df))
     for i in range(probe_n):
-        dataset_id = df.iloc[i]['dataset_id'] if 'dataset_id' in df.columns else df.iloc[i].iloc[0]
-        try:
-            vars_list = get_dataset_variables(server, dataset_id)
-            if not vars_list:
-                continue
-            vars_lower = [v.lower() for v in vars_list]
-            # look for best candidate among our preferred names
-            for candidate in info['var_names']:
-                if candidate.lower() in vars_lower:
-                    # return the actual variable name as appears in the dataset (case preserved)
-                    matched = [v for v in vars_list if v.lower() == candidate.lower()][0]
-                    return dataset_id, matched
-            # fallback: return first non-dimension variable
-            # pick the longest variable name that looks like a data var (not 'latitude'/'time')
-            non_geo = [v for v in vars_list if v.lower() not in ('latitude', 'longitude', 'time', 'depth')]
-            if non_geo:
-                return dataset_id, non_geo[0]
-        except Exception:
+        dataset_id = df.iloc[i]['dataset_id']
+        vars_list = get_dataset_variables(server, dataset_id)
+        if not vars_list:
             continue
+        vs = [v.lower() for v in vars_list]
+        for candidate in info['var_names']:
+            if candidate.lower() in vs:
+                matched = [v for v in vars_list if v.lower() == candidate.lower()][0]
+                return dataset_id, matched
+        non_geo = [v for v in vars_list if v.lower() not in ('latitude','longitude','time','depth')]
+        if non_geo:
+            return dataset_id, non_geo[0]
 
     return None, None
 
 
 # -------------------------
-# Plot helpers
+# Plot helpers (used in Streamlit/Flask)
 # -------------------------
 def timeseries_plot(df, variable):
     """Create a Plotly figure for a small timeseries DataFrame."""
@@ -426,17 +366,34 @@ def timeseries_plot(df, variable):
         fig = go.Figure()
         fig.update_layout(title='No data')
         return fig
-    # Find the variable column (exclude latitude longitude time)
+
     candidates = [c for c in df.columns if c not in ['time', 'latitude', 'longitude']]
     varcol = variable if variable in df.columns else (candidates[0] if candidates else None)
     if varcol is None:
         fig = go.Figure()
         fig.update_layout(title='Variable not found in fetched data')
         return fig
+
     # ensure time is datetime
     if 'time' in df.columns:
         df['time'] = pd.to_datetime(df['time'], errors='coerce')
-    fig = px.line(df.sort_values('time'), x='time', y=varcol, title=f"{varcol} @ {df['latitude'].median():.3f},{df['longitude'].median():.3f}")
+
+    # compute safe median coords for title
+    median_lat = None
+    median_lon = None
+    if 'latitude' in df.columns:
+        median_lat = pd.to_numeric(df['latitude'], errors='coerce').median()
+    if 'longitude' in df.columns:
+        median_lon = pd.to_numeric(df['longitude'], errors='coerce').median()
+
+    coord_str = ""
+    if pd.notna(median_lat) and pd.notna(median_lon):
+        coord_str = f" @ {median_lat:.3f},{median_lon:.3f}"
+    else:
+        if 'latitude' in df.columns and 'longitude' in df.columns:
+            coord_str = f" @ {str(df['latitude'].iloc[0])},{str(df['longitude'].iloc[0])}"
+
+    fig = px.line(df.sort_values('time'), x='time', y=varcol, title=f"{varcol}{coord_str}")
     fig.update_xaxes(rangeslider_visible=True)
     return fig
 
@@ -453,7 +410,6 @@ def map_scatter_plot(df, variable):
         fig = go.Figure()
         fig.update_layout(title='Variable not found')
         return fig
-    # Use latest time slice
     if 'time' in df.columns:
         df['time'] = pd.to_datetime(df['time'], errors='coerce')
         latest_time = df['time'].max()
@@ -461,13 +417,10 @@ def map_scatter_plot(df, variable):
     else:
         df_latest = df
         latest_time = None
-
-    # make sure lat/lon exist
     if 'latitude' not in df_latest.columns or 'longitude' not in df_latest.columns:
         fig = go.Figure()
         fig.update_layout(title='No spatial coordinates in data')
         return fig
-
     fig = px.scatter_geo(df_latest, lat='latitude', lon='longitude', size_max=8,
                          hover_name=varcol, hover_data=['time', 'latitude', 'longitude'],
                          projection='natural earth')
@@ -479,14 +432,105 @@ def map_scatter_plot(df, variable):
 
 
 # -------------------------
-# Streamlit widget (drop-in)
+# CLI-friendly runner & small helpers
+# -------------------------
+def summarize_df(df, variable_col=None, nrows=10):
+    """Return a small friendly text summary for console output."""
+    if df.empty:
+        return "No data available for the requested query."
+    # ensure time column
+    if 'time' in df.columns:
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        df = df.sort_values('time')
+    txt = []
+    txt.append(f"Rows returned: {len(df)}")
+    # print first n rows
+    display_cols = ['time']
+    if 'latitude' in df.columns and 'longitude' in df.columns:
+        display_cols += ['latitude', 'longitude']
+    # pick one data column
+    data_cols = [c for c in df.columns if c not in display_cols]
+    if data_cols:
+        data_col = variable_col if variable_col in df.columns else data_cols[0]
+        display_cols += [data_col]
+    else:
+        data_col = None
+
+    txt.append("\nSample (first %d rows):" % min(nrows, len(df)))
+    sample = df[display_cols].head(nrows).copy()
+    # Format index-free table
+    txt += sample.to_string(index=False).splitlines()
+    if data_col:
+        ser = pd.to_numeric(df[data_col], errors='coerce')
+        valid = ser.dropna()
+        if not valid.empty:
+            txt.append("\nSummary statistics for %s:" % data_col)
+            txt.append(f"  Count: {int(valid.count())}")
+            txt.append(f"  Mean: {valid.mean():.3f}")
+            txt.append(f"  Std: {valid.std():.3f}")
+            txt.append(f"  Min: {valid.min():.3f}")
+            txt.append(f"  Max: {valid.max():.3f}")
+        else:
+            txt.append(f"\nNo numeric values found in column '{data_col}'.")
+    return "\n".join(txt)
+
+
+def cli_fetch_and_print(args):
+    # Resolve lat/lon
+    latlon = None
+    if args.lat is not None and args.lon is not None:
+        latlon = (args.lat, args.lon)
+    elif args.place:
+        latlon = geocode_place(args.place)
+
+    if latlon is None:
+        print("Please provide --lat and --lon or --place (place name).")
+        return 2
+
+    lat, lon = latlon
+
+    # Decide dataset/variable
+    if args.dataset and args.var:
+        dataset_id = args.dataset
+        varname = args.var
+    else:
+        # pick by friendly variable
+        dataset_id, varname = pick_dataset_and_var(args.server, args.var_friendly or 'Temperature')
+        if dataset_id is None:
+            print("Could not auto-detect dataset/variable. Try using --dataset and --var to override.")
+            return 3
+
+    # Date selection
+    if args.start and args.end:
+        try:
+            start_dt = datetime.fromisoformat(args.start).date()
+            end_dt = datetime.fromisoformat(args.end).date()
+        except Exception:
+            print("start/end must be ISO dates like 2025-01-01")
+            return 4
+    elif args.start_year and args.end_year:
+        start_dt = datetime(int(args.start_year), 1, 1).date()
+        end_dt = datetime(int(args.end_year), 12, 31).date()
+    else:
+        # default to last N days
+        end_dt = datetime.utcnow().date()
+        start_dt = end_dt - timedelta(days=args.days - 1)
+
+    # fetch
+    df = fetch_griddap_point_timeseries(args.server, dataset_id, varname, lat, lon,
+                                       end_date=end_dt, days=args.days,
+                                       start_year=None, end_year=None, debug=False)
+
+    out = summarize_df(df, variable_col=varname, nrows=10)
+    print(f"Using dataset: {dataset_id}  variable: {varname}")
+    print(out)
+    return 0
+
+
+# -------------------------
+# Streamlit widget (drop-in - unchanged API)
 # -------------------------
 def erddap_streamlit_widget(server=ERDDAP_SERVER):
-    """If your app is Streamlit, call this function in your main UI to mount the ERDDAP widget.
-
-    It creates an options select (Temperature/Salinity/Chlorophyll), a place text input (or manual lat,lon),
-    timeframe selector (years), and renders Plotly charts inline.
-    """
     try:
         import streamlit as st
     except Exception:
@@ -495,7 +539,6 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
 
     st.sidebar.header('Ocean data (ERDDAP)')
     var_choice = st.sidebar.selectbox('Variable', list(DEFAULT_VARIABLES.keys()))
-    # Show recommended datasets for this variable (helps user choose overrides quickly)
     prefs = get_preferred_for(var_choice)
     if prefs:
         st.sidebar.markdown("**Recommended datasets:**")
@@ -505,12 +548,12 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
     place = st.sidebar.text_input('Place name (or leave blank to enter lat,lon manually)')
     manual_latlon = st.sidebar.text_input('Manual lat,lon (e.g. "20.5,70.2")')
     current_year = datetime.utcnow().year
-    year_range = st.sidebar.slider('Year range', min_value=1980, max_value=current_year, value=(current_year-1, current_year), step=1)
+    year_range = st.sidebar.slider('Year range', min_value=1980, max_value=current_year,
+                                   value=(current_year-1, current_year), step=1)
     start_year, end_year = year_range
     server_input = st.sidebar.text_input('ERDDAP server', value=server)
 
     if st.sidebar.button('Fetch'):
-        # resolve lat lon
         latlon = None
         if manual_latlon and manual_latlon.strip():
             try:
@@ -532,10 +575,8 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
 
         if latlon is None:
             st.stop()
-
         lat, lon = latlon
 
-        # Optional manual overrides for dataset & var (very useful when auto-pick fails)
         st.markdown("**Optional overrides (use if automatic discovery returns no data):**")
         manual_dataset = st.text_input('Override dataset_id (leave blank to use auto-discovery)')
         manual_var = st.text_input('Override variable name (leave blank to use auto-detected var)')
@@ -546,10 +587,8 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
                 if manual_var and manual_var.strip():
                     varname = manual_var.strip()
                 else:
-                    # try to auto-detect a variable in the user-supplied dataset
                     vars_list = get_dataset_variables(server_input, dataset_id)
                     if vars_list:
-                        # pick first candidate matching our desired list
                         candidate = None
                         for c in DEFAULT_VARIABLES[var_choice]['var_names']:
                             if c.lower() in [v.lower() for v in vars_list]:
@@ -567,8 +606,9 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
 
         st.write(f"Using dataset: **{dataset_id}** and variable **{varname}**")
 
-        with st.spinner('Fetching timeseries for years %d - %d (may try larger bbox)...' % (start_year, end_year)):
-            result = fetch_griddap_point_timeseries(server_input, dataset_id, varname, lat, lon, start_year=start_year, end_year=end_year, debug=True)
+        with st.spinner('Fetching timeseries (may try larger bbox)...'):
+            result = fetch_griddap_point_timeseries(server_input, dataset_id, varname, lat, lon,
+                                                   start_year=start_year, end_year=end_year, debug=True)
             if isinstance(result, tuple):
                 df, raw_texts = result
             else:
@@ -576,22 +616,20 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
                 raw_texts = []
 
         if df.empty:
-            st.error('No data returned for that dataset/variable/point/time. Showing debug info below.')
-            for i, (u, t) in enumerate(raw_texts[:8]):
+            st.error('No data returned for that dataset/variable/point/time.')
+            for i, (u, t) in enumerate(raw_texts[:6]):
                 st.markdown(f"**Attempt {i+1}**: `{u}`")
-                st.code(t[:4000])
-            st.info('Try entering a different dataset_id, a different variable name (e.g. sst, sss), a nearby lat/lon, or expand the year range.')
+                st.code(t[:2000])
+            st.info('Try entering a different dataset_id/variable or expand the year range.')
             return
 
         st.subheader('Timeseries')
         fig_ts = timeseries_plot(df, varname)
         st.plotly_chart(fig_ts, use_container_width=True)
-
         st.subheader('Map (latest slice)')
         fig_map = map_scatter_plot(df, varname)
         st.plotly_chart(fig_map, use_container_width=True)
 
-        # Quick stats
         try:
             latest = df.loc[df['time'].idxmax()]
             val = None
@@ -599,28 +637,21 @@ def erddap_streamlit_widget(server=ERDDAP_SERVER):
                 if c not in ['time', 'latitude', 'longitude']:
                     val = latest[c]
                     break
-            if val is not None and (isinstance(val, (int, float)) or hasattr(val, '__float__')):
+            if val is not None:
                 st.metric(label=f"Latest {varname}", value=f"{float(val):.3f}")
         except Exception:
             pass
 
 
 # -------------------------
-# Flask blueprint (optional)
+# Flask blueprint unchanged
 # -------------------------
 def register_erddap_blueprint(app, server=ERDDAP_SERVER):
-    """Register a small Flask blueprint at /erddap for interactive queries.
-
-    This adds routes GET/POST /erddap with a simple form and embedded Plotly charts.
-    """
     try:
         from flask import Blueprint, request, render_template_string
     except Exception:
-        print('Flask not available or not requested; skipping blueprint registration')
         return
-
     bp = Blueprint('erddap_integration', __name__, template_folder='templates')
-
     FORM_HTML = """
     <!doctype html>
     <html>
@@ -641,7 +672,6 @@ def register_erddap_blueprint(app, server=ERDDAP_SERVER):
     </body>
     </html>
     """
-
     @bp.route('/erddap', methods=['GET', 'POST'])
     def erddap_form():
         charts_html = ''
@@ -650,7 +680,6 @@ def register_erddap_blueprint(app, server=ERDDAP_SERVER):
             place = request.form.get('place','').strip()
             manual = request.form.get('latlon','').strip()
             days = int(request.form.get('days') or 7)
-
             latlon = None
             if manual:
                 try:
@@ -662,40 +691,53 @@ def register_erddap_blueprint(app, server=ERDDAP_SERVER):
                 g = geocode_place(place)
                 if g:
                     latlon = g
-
             if not latlon:
                 charts_html = '<p>Could not geocode place. Provide manual lat,lon in the form.</p>'
                 return render_template_string(FORM_HTML, charts=charts_html)
-
             lat, lon = latlon
             dataset_id, varname = pick_dataset_and_var(server, var_choice)
             if not dataset_id:
                 charts_html = '<p>Could not find dataset automatically; try another variable.</p>'
                 return render_template_string(FORM_HTML, charts=charts_html)
-
             df = fetch_griddap_point_timeseries(server, dataset_id, varname, lat, lon, days=days)
             if df.empty:
                 charts_html = '<p>No data returned for that query.</p>'
                 return render_template_string(FORM_HTML, charts=charts_html)
-
             fig_ts = timeseries_plot(df, varname)
             fig_map = map_scatter_plot(df, varname)
             charts_html = '<div id="ts"></div><div id="map"></div>'
             charts_html += f"<script>var fig_ts = {fig_ts.to_json()}; Plotly.newPlot('ts', fig_ts.data, fig_ts.layout);</script>"
             charts_html += f"<script>var fig_map = {fig_map.to_json()}; Plotly.newPlot('map', fig_map.data, fig_map.layout);</script>"
-
         return render_template_string(FORM_HTML, charts=charts_html)
-
     app.register_blueprint(bp)
-    print('ERDDAP blueprint registered at /erddap')
 
 
 # -------------------------
-# Small test runner (local quick test)
+# CLI entrypoint
 # -------------------------
-if __name__ == '__main__':
-    print('Discovering SST datasets (quick test)...')
+def build_argparser():
+    p = argparse.ArgumentParser(prog="erddap_integration.py", description="Fetch point timeseries from ERDDAP and print friendly output")
+    p.add_argument("--server", default=ERDDAP_SERVER, help="ERDDAP server base URL")
+    p.add_argument("--lat", type=float, help="Latitude of point (decimal degrees)")
+    p.add_argument("--lon", type=float, help="Longitude of point (decimal degrees)")
+    p.add_argument("--place", type=str, help="Place name (geocoded via Nominatim if geopy not available)")
+    p.add_argument("--var", help="Explicit variable name on dataset (use with --dataset)")
+    p.add_argument("--dataset", help="Explicit dataset id (if you know it)")
+    p.add_argument("--var-friendly", help="Friendly variable name (Temperature/Salinity/Chlorophyll)", default="Temperature")
+    p.add_argument("--days", type=int, default=30, help="Number of days back from today to fetch (default 30)")
+    p.add_argument("--start", help="ISO start date (YYYY-MM-DD)")
+    p.add_argument("--end", help="ISO end date (YYYY-MM-DD)")
+    p.add_argument("--start-year", help="Start year for full-year fetch (e.g. 2015)")
+    p.add_argument("--end-year", help="End year for full-year fetch (e.g. 2020)")
+    return p
+
+
+if __name__ == "__main__":
+    parser = build_argparser()
+    args = parser.parse_args()
     try:
-        print(discover_erddap_datasets())
-    except Exception as e:
-        print('Smoke test failed:', e)
+        rc = cli_fetch_and_print(args)
+        sys.exit(rc)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(130)
