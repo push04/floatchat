@@ -252,6 +252,12 @@ def resolve_common_to_scientific(query: str) -> Tuple[str, str]:
     return q, "Unchanged"
 
 # ----------- OBIS INTEGRATION -----------
+
+
+class OBISFetchError(Exception):
+    """Raised when the OBIS service cannot fulfill a request."""
+
+
 def _sanitize_bbox(bbox: Dict[str, Any]) -> Dict[str, float]:
     """Validate and coerce a bounding box dictionary."""
     required = ("lonmin", "lonmax", "latmin", "latmax")
@@ -276,7 +282,72 @@ def _sanitize_bbox(bbox: Dict[str, Any]) -> Dict[str, float]:
     return {"lonmin": lonmin, "lonmax": lonmax, "latmin": latmin, "latmax": latmax}
 
 
+def _bbox_to_wkt(bbox: Dict[str, float]) -> str:
+    return (
+        "POLYGON(("
+        f"{bbox['lonmin']} {bbox['latmin']}, "
+        f"{bbox['lonmax']} {bbox['latmin']}, "
+        f"{bbox['lonmax']} {bbox['latmax']}, "
+        f"{bbox['lonmin']} {bbox['latmax']}, "
+        f"{bbox['lonmin']} {bbox['latmin']}))"
+    )
+
+
+def _request_obis(params: Dict[str, Any], retries: int = 3, timeout: float = 40.0) -> requests.Response:
+    backoff = 1.2
+    last_exception: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(OBIS_API_URL, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            last_exception = exc
+        else:
+            if response.status_code >= 500 and attempt < retries:
+                time.sleep(min(6.0, backoff ** attempt))
+                continue
+            return response
+        time.sleep(min(6.0, backoff ** attempt))
+    if last_exception is not None:
+        raise OBISFetchError(f"OBIS request failed: {last_exception}")
+    raise OBISFetchError("OBIS request failed after repeated server errors")
+
+
 @cache_data(ttl=60 * 30)
+def _fetch_obis_records_cached(species_name: str, size: int, geometry: Optional[str]) -> pd.DataFrame:
+    params = {"scientificname": species_name, "size": size}
+    if geometry:
+        params["geometry"] = geometry
+
+    response = _request_obis(params)
+
+    if response.status_code >= 400:
+        detail = None
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                for key in ("message", "error", "detail"):
+                    if payload.get(key):
+                        detail = str(payload[key])
+                        break
+        except ValueError:
+            pass
+
+        if not detail:
+            detail = response.reason or response.text[:200]
+        raise OBISFetchError(f"OBIS request failed with status {response.status_code}: {detail}")
+
+    try:
+        js = response.json()
+    except ValueError as exc:
+        raise OBISFetchError(f"OBIS response was not valid JSON: {exc}") from exc
+
+    results = js.get("results", []) if isinstance(js, dict) else []
+    if not isinstance(results, list):
+        raise OBISFetchError("OBIS response format was unexpected")
+
+    return pd.DataFrame(results)
+
+
 def fetch_obis_records(
     species_name: str,
     size: int = 200,
@@ -289,55 +360,21 @@ def fetch_obis_records(
     except (TypeError, ValueError):
         return pd.DataFrame(), "Requested record count must be an integer"
 
-    params = {"scientificname": species_name, "size": size_int}
-
+    geometry: Optional[str] = None
     if bbox:
         try:
             bbox_clean = _sanitize_bbox(bbox)
         except ValueError as exc:
             return pd.DataFrame(), f"Invalid bounding box: {exc}"
-        poly = (
-            "POLYGON(("
-            f"{bbox_clean['lonmin']} {bbox_clean['latmin']}, "
-            f"{bbox_clean['lonmax']} {bbox_clean['latmin']}, "
-            f"{bbox_clean['lonmax']} {bbox_clean['latmax']}, "
-            f"{bbox_clean['lonmin']} {bbox_clean['latmax']}, "
-            f"{bbox_clean['lonmin']} {bbox_clean['latmin']}))"
-        )
-        params["geometry"] = poly
+        geometry = _bbox_to_wkt(bbox_clean)
 
     try:
-        r = requests.get(OBIS_API_URL, params=params, timeout=40)
-    except requests.RequestException as exc:
-        return pd.DataFrame(), f"OBIS request failed: {exc}"
+        df = _fetch_obis_records_cached(species_name, size_int, geometry)
+    except OBISFetchError as exc:
+        return pd.DataFrame(), str(exc)
 
-    if r.status_code >= 400:
-        detail = None
-        try:
-            payload = r.json()
-            if isinstance(payload, dict):
-                for key in ("message", "error", "detail"):
-                    if payload.get(key):
-                        detail = str(payload[key])
-                        break
-        except ValueError:
-            # Response body is not JSON – fall back to reason/text
-            pass
+    return df, None
 
-        if not detail:
-            detail = r.reason or r.text[:200]
-        return pd.DataFrame(), f"OBIS request failed with status {r.status_code}: {detail}"
-
-    try:
-        js = r.json()
-    except ValueError as exc:
-        return pd.DataFrame(), f"OBIS response was not valid JSON: {exc}"
-
-    results = js.get("results", []) if isinstance(js, dict) else []
-    if not isinstance(results, list):
-        return pd.DataFrame(), "OBIS response format was unexpected"
-
-    return pd.DataFrame(results), None
 
 def make_plots_from_df(df: pd.DataFrame, species_name: str) -> Dict[str, Any]:
     figs = {}
@@ -473,7 +510,7 @@ def generate_pdf_report(df: pd.DataFrame, species_name: str, summary_text: str, 
     title = f"OBIS Report — {species_name}" if species_name else "OBIS Report"
     story.append(Paragraph(title, styles["ReportTitle"]))
     story.append(Spacer(1, 6))
-    story.append(Paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", styles["Meta"]))
+    story.append(Paragraph(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", styles["Meta"]))
     story.append(Paragraph(f"Total records: {len(df)}", styles["Meta"]))
     story.append(Spacer(1, 10))
     story.append(Paragraph("AI Summary", styles["Heading"]))
@@ -943,6 +980,7 @@ with st.sidebar:
 
     max_records = st.slider("Max OBIS records", 10, 3000, 500, step=10)
     bbox_enable = st.checkbox("Filter by bounding box", value=False)
+    st.session_state["bbox_enable"] = bbox_enable
     if bbox_enable:
         lon_min = st.number_input("Lon min", value=68.0, step=0.1, format="%.3f")
         lon_max = st.number_input("Lon max", value=96.0, step=0.1, format="%.3f")
@@ -985,7 +1023,7 @@ st.session_state.setdefault("bookmarks", [])
 
 def add_to_history(display, scientific, provenance):
     st.session_state["search_history"].append({
-        "t": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "t": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "q": display, "sci": scientific, "prov": provenance
     })
     if len(st.session_state["search_history"]) > 20:
@@ -1060,7 +1098,7 @@ if df_prev is not None and not df_prev.empty:
             with st.spinner("AI analyzing..."):
                 ans = ask_openrouter([{"role":"system","content":"You are a helpful marine data assistant. Be concise."},
                                       {"role":"user","content":"\n\n".join(parts)}])
-            st.session_state.setdefault("data_ai_history", []).append({"q": ai_q, "a": ans, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")})
+            st.session_state.setdefault("data_ai_history", []).append({"q": ai_q, "a": ans, "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
             st.session_state["last_summary"] = st.session_state.get("last_summary") or ans
             st.markdown("**AI answer:**"); st.markdown(ans)
 
@@ -1225,7 +1263,7 @@ if submitted and query.strip():
                     with st.spinner("AI analyzing..."):
                         ans = ask_openrouter([{"role":"system","content":"You are a helpful marine data assistant. Be concise."},
                                               {"role":"user","content":"\n\n".join(parts)}])
-                    st.session_state.setdefault("data_ai_history", []).append({"q": ai_q, "a": ans, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")})
+                    st.session_state.setdefault("data_ai_history", []).append({"q": ai_q, "a": ans, "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
                     st.session_state["last_summary"] = ans
                     st.markdown("**AI answer:**"); st.markdown(ans)
 
@@ -1265,4 +1303,4 @@ with st.expander("Saved searches & bookmarks"):
 # ----------- FOOTER -----------
 st.markdown("---")
 st.markdown("<div class='small muted'>Data: OBIS (api.obis.org) • ERDDAP • Geocoding: Nominatim • LLM: OpenRouter</div>", unsafe_allow_html=True)
-st.markdown("<div class='muted small'>Last updated: " + datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC") + "</div>", unsafe_allow_html=True)
+st.markdown("<div class='muted small'>Last updated: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "</div>", unsafe_allow_html=True)
