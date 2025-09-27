@@ -308,9 +308,25 @@ def fetch_obis_records(
 
     try:
         r = requests.get(OBIS_API_URL, params=params, timeout=40)
-        r.raise_for_status()
     except requests.RequestException as exc:
         return pd.DataFrame(), f"OBIS request failed: {exc}"
+
+    if r.status_code >= 400:
+        detail = None
+        try:
+            payload = r.json()
+            if isinstance(payload, dict):
+                for key in ("message", "error", "detail"):
+                    if payload.get(key):
+                        detail = str(payload[key])
+                        break
+        except ValueError:
+            # Response body is not JSON – fall back to reason/text
+            pass
+
+        if not detail:
+            detail = r.reason or r.text[:200]
+        return pd.DataFrame(), f"OBIS request failed with status {r.status_code}: {detail}"
 
     try:
         js = r.json()
