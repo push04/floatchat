@@ -252,16 +252,76 @@ def resolve_common_to_scientific(query: str) -> Tuple[str, str]:
     return q, "Unchanged"
 
 # ----------- OBIS INTEGRATION -----------
+def _sanitize_bbox(bbox: Dict[str, Any]) -> Dict[str, float]:
+    """Validate and coerce a bounding box dictionary."""
+    required = ("lonmin", "lonmax", "latmin", "latmax")
+    missing = [k for k in required if k not in bbox]
+    if missing:
+        raise ValueError(f"Missing keys: {', '.join(missing)}")
+    try:
+        lonmin = float(bbox["lonmin"])
+        lonmax = float(bbox["lonmax"])
+        latmin = float(bbox["latmin"])
+        latmax = float(bbox["latmax"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Bounding box values must be numeric") from exc
+    if lonmin >= lonmax:
+        raise ValueError("Longitude minimum must be less than maximum")
+    if latmin >= latmax:
+        raise ValueError("Latitude minimum must be less than maximum")
+    if not (-180.0 <= lonmin <= 180.0 and -180.0 <= lonmax <= 180.0):
+        raise ValueError("Longitudes must be within -180 to 180")
+    if not (-90.0 <= latmin <= 90.0 and -90.0 <= latmax <= 90.0):
+        raise ValueError("Latitudes must be within -90 to 90")
+    return {"lonmin": lonmin, "lonmax": lonmax, "latmin": latmin, "latmax": latmax}
+
+
 @cache_data(ttl=60 * 30)
-def fetch_obis_records(species_name: str, size: int = 200, bbox: Optional[Dict] = None) -> pd.DataFrame:
-    params = {"scientificname": species_name, "size": int(size)}
-    if bbox and all(k in bbox for k in ("lonmin", "lonmax", "latmin", "latmax")):
-        poly = f"POLYGON(({bbox['lonmin']} {bbox['latmin']}, {bbox['lonmax']} {bbox['latmin']}, {bbox['lonmax']} {bbox['latmax']}, {bbox['lonmin']} {bbox['latmax']}, {bbox['lonmin']} {bbox['latmin']}))"
+def fetch_obis_records(
+    species_name: str,
+    size: int = 200,
+    bbox: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Fetch OBIS occurrences, returning (dataframe, error_message)."""
+
+    try:
+        size_int = max(1, int(size))
+    except (TypeError, ValueError):
+        return pd.DataFrame(), "Requested record count must be an integer"
+
+    params = {"scientificname": species_name, "size": size_int}
+
+    if bbox:
+        try:
+            bbox_clean = _sanitize_bbox(bbox)
+        except ValueError as exc:
+            return pd.DataFrame(), f"Invalid bounding box: {exc}"
+        poly = (
+            "POLYGON(("
+            f"{bbox_clean['lonmin']} {bbox_clean['latmin']}, "
+            f"{bbox_clean['lonmax']} {bbox_clean['latmin']}, "
+            f"{bbox_clean['lonmax']} {bbox_clean['latmax']}, "
+            f"{bbox_clean['lonmin']} {bbox_clean['latmax']}, "
+            f"{bbox_clean['lonmin']} {bbox_clean['latmin']}))"
+        )
         params["geometry"] = poly
-    r = requests.get(OBIS_API_URL, params=params, timeout=40)
-    r.raise_for_status()
-    js = r.json()
-    return pd.DataFrame(js.get("results", []))
+
+    try:
+        r = requests.get(OBIS_API_URL, params=params, timeout=40)
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        return pd.DataFrame(), f"OBIS request failed: {exc}"
+
+    try:
+        js = r.json()
+    except ValueError as exc:
+        return pd.DataFrame(), f"OBIS response was not valid JSON: {exc}"
+
+    results = js.get("results", []) if isinstance(js, dict) else []
+    if not isinstance(results, list):
+        return pd.DataFrame(), "OBIS response format was unexpected"
+
+    return pd.DataFrame(results), None
 
 def make_plots_from_df(df: pd.DataFrame, species_name: str) -> Dict[str, Any]:
     figs = {}
@@ -1038,18 +1098,38 @@ if submitted and query.strip():
         if st.button(f"⭐ Bookmark {sci}", key=f"bm_{sci}"):
             bookmark_current(sci); st.success("Bookmarked!")
 
-        with st.spinner("Fetching OBIS records..."):
-            bbox = None
-            if st.session_state.get("bbox_enable", bbox_enable):
-                bbox = {"lonmin": lon_min, "lonmax": lon_max, "latmin": lat_min, "latmax": lat_max}
-            df = fetch_obis_records(sci, size=max_records, bbox=bbox)
+        df = pd.DataFrame()
+        fetch_error: Optional[str] = None
 
-        # Date filter
-        if not df.empty and "eventDate" in df.columns:
+        if start_date and end_date and start_date > end_date:
+            fetch_error = "Start date must be on or before end date."
+        else:
+            bbox_params = None
+            if st.session_state.get("bbox_enable", bbox_enable):
+                try:
+                    bbox_params = _sanitize_bbox({
+                        "lonmin": lon_min,
+                        "lonmax": lon_max,
+                        "latmin": lat_min,
+                        "latmax": lat_max,
+                    })
+                except ValueError as exc:
+                    fetch_error = f"Bounding box error: {exc}"
+
+            if fetch_error is None:
+                with st.spinner("Fetching OBIS records..."):
+                    df, fetch_error = fetch_obis_records(sci, size=max_records, bbox=bbox_params)
+
+        if fetch_error:
+            left.error(fetch_error)
+
+        if not fetch_error and not df.empty and "eventDate" in df.columns:
             try:
                 df["eventDate"] = pd.to_datetime(df["eventDate"], errors="coerce")
-                if start_date: df = df[df["eventDate"] >= pd.to_datetime(start_date)]
-                if end_date: df = df[df["eventDate"] <= pd.to_datetime(end_date)]
+                if start_date:
+                    df = df[df["eventDate"] >= pd.to_datetime(start_date)]
+                if end_date:
+                    df = df[df["eventDate"] <= pd.to_datetime(end_date)]
             except Exception:
                 pass
 
