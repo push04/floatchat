@@ -1,754 +1,274 @@
-"""
-obis_ai_dashboard.py
-Single-input version: one text box for both AI and dataset routing.
-Enhanced: persistent cached view, date filters, interactive plots,
-CSV/Excel export, PDF report export (images via kaleido + reportlab).
-Run:
-    pip install streamlit requests pandas plotly kaleido reportlab openpyxl
-    streamlit run obis_ai_dashboard.py
-"""
+# app.py
+# A single, full-featured Streamlit app merging OBIS + ERDDAP + AI + Auto name routing.
 
-import streamlit as st
+import os
+import io
+import re
+import sys
+import math
+import json
+import uuid
+import time
+import base64
+import tempfile
+import calendar
+import html
+from io import StringIO, BytesIO
+from datetime import datetime, date, timedelta, timezone
+from typing import Optional, Tuple, Dict, Any, List
+
 import requests
 import pandas as pd
-import plotly.express as px
-import plotly.io as pio
-import time
-from datetime import datetime, date
-import json
-from io import StringIO, BytesIO
-import base64
-import math
+import numpy as np
 
-import sys
-print(sys.executable)
-
-import matplotlib.pyplot as plt
-import tempfile
-
-# add near other imports at top of file
-
-# --- NetCDF / xarray support (paste here) ---
-import xarray as xr
-from netCDF4 import Dataset
-import os
-# xarray uses numpy already imported in file
-
-
+import streamlit as st
 import streamlit.components.v1 as components
-# ERDDAP widget (paste after your other imports)
-from erddap_integration import erddap_streamlit_widget
 
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
 
+import xarray as xr
+from netCDF4 import Dataset  # noqa: F401  # xarray netcdf backend uses it
 
-
-
-
-
-def _sanitize_value(v):
-    """Convert pandas / numpy / datetime types to plain Python (JSON-friendly) values."""
-    try:
-        if v is None:
-            return None
-        # pandas NA
-        if pd.isna(v):
-            return None
-        # pandas Timestamp or datetime -> ISO string
-        if isinstance(v, (pd.Timestamp, datetime)):
-            return v.isoformat()
-        if isinstance(v, date):
-            return v.isoformat()
-        # numpy scalars -> native python
-        if isinstance(v, (np.integer, np.int_, np.int32, np.int64)):
-            return int(v)
-        if isinstance(v, (np.floating, np.float_, np.float32, np.float64)):
-            return float(v)
-        if isinstance(v, (np.bool_, np.bool8)):
-            return bool(v)
-        if isinstance(v, (bytes, bytearray)):
-            try:
-                return v.decode("utf-8")
-            except Exception:
-                return str(v)
-        return v
-    except Exception:
-        return str(v)
-
-def save_obis_df(df: pd.DataFrame):
-    """Save dataframe into session_state as plain Python structures (safe across reruns)."""
-    records = []
-    for r in df.to_dict(orient="records"):
-        rec = {k: _sanitize_value(v) for k, v in r.items()}
-        records.append(rec)
-    st.session_state["obis_df_records"] = records
-    st.session_state["obis_df_columns"] = list(df.columns)
-
-def load_obis_df() -> pd.DataFrame | None:
-    """Reconstruct DataFrame from session_state. Return None if not present."""
-    recs = st.session_state.get("obis_df_records")
-    cols = st.session_state.get("obis_df_columns")
-    # be explicit: only None means missing (empty list is valid)
-    if recs is None or cols is None:
-        return None
-    try:
-        df = pd.DataFrame(recs, columns=cols)
-        # attempt to parse common datetime back into datetime dtype
-        if "eventDate" in df.columns:
-            df["eventDate"] = pd.to_datetime(df["eventDate"], errors="coerce")
-        return df
-    except Exception:
-        try:
-            return pd.DataFrame(recs)
-        except Exception:
-            return None
-
-
-
-# --- Compatibility helpers (typing, streamlit cache compatibility) ---
-from typing import Optional
-
-# Streamlit changed caching API in newer versions. Provide a safe fallback so this file
-# runs on older Streamlit installs too.
+# Optional geocoding
 try:
-    cache_data = st.cache_data  # Streamlit 1.18+
+    from geopy.geocoders import Nominatim
+    GEOPY_AVAILABLE = True
 except Exception:
-    cache_data = getattr(st, "cache", None) or (lambda **kw: (lambda f: f))
+    GEOPY_AVAILABLE = False
 
+# ----------- CONSTANTS & CONFIG -----------
+OBIS_API_URL = "https://api.obis.org/v3/occurrence"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
+OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))
 
+# ERDDAP defaults/curation (inlined from your module)
+ERDDAP_SERVER_DEFAULT = "https://coastwatch.noaa.gov/erddap"
+NRT_CUTOFF_DAYS = 60
+CURATED_DATASETS = {
+    "global": [
+        "noaacwBLENDEDsstDaily",
+        "noaacwBLENDEDsstDNDaily",
+        "OISSTs_2022_v05_1",
+        "jplMURSST41",
+        "noaacwecnMURannual",
+    ],
+    "https://erddap.incois.gov.in/erddap": [
+        "NOAA_AVHRR_AMSR_datasets",
+        "incois_argo_sst_weekly",
+        "incois_valueadded_products_datasets",
+        "AMSR2_3day_Global",
+        "incois_argo_10d_VAM",
+    ],
+    "https://erddap.aoml.noaa.gov/hdb/erddap": ["OISSTs_2022_v05_1"],
+    "https://erddap.marine.usf.edu/erddap": ["jplMURSST41"],
+    "https://coastwatch.pfeg.noaa.gov/erddap": ["jplMURSST41", "noaacwBLENDEDsstDaily"],
+}
 
-def plot_year_distribution(df):
-    fig, ax = plt.subplots(figsize=(6,4))
-    if "eventDate_parsed" in df.columns:
-        df['year'] = df['eventDate_parsed'].dt.year
-        df['year'].dropna().astype(int).value_counts().sort_index().plot(ax=ax)
-        ax.set_title("Records by Year")
-        ax.set_xlabel("Year")
-        ax.set_ylabel("Count")
-    return fig
+# ----------- STREAMLIT PAGE -----------
+st.set_page_config(
+    page_title="FloatChat | AI-Powered Ocean Data Discovery",
+    page_icon="🌊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def plot_depth_distribution_plotly(df):
-    """
-    Depth distribution using plotly.express.histogram.
-    Returns a plotly.graph_objects.Figure (or None if no data).
-    """
-    if "depth" not in df.columns or not df["depth"].notna().any():
-        return None
-    # coerce to numeric and drop NaNs
-    series = pd.to_numeric(df["depth"].dropna(), errors="coerce").dropna()
-    if series.empty:
-        return None
+# ----------- THEME / CSS -----------
+THEMES = {
+    "Ocean Dark": """
+    .stApp { background: linear-gradient(180deg,#071022 0%, #081526 45%, #0b2b3a 100%); color:#e6f0f6; font-family: Inter, Segoe UI, Roboto, sans-serif; }
+    .card { background: rgba(255,255,255,0.03); border-radius: 16px; padding: 16px; box-shadow: 0 6px 18px rgba(2,6,23,0.6); border:1px solid rgba(255,255,255,0.04);}
+    .stat { display:inline-block; padding:10px 14px; margin-right:8px; background: rgba(255,255,255,0.04); border-radius:12px; border:1px solid rgba(255,255,255,0.06); }
+    .muted { color:#9fb7c7; } .small { font-size:0.85rem; color:#bcd7e6; }
+    button.stButton>button { background: linear-gradient(90deg,#0b84ff 0%, #6ee7b7 100%); color:#06202a; font-weight:600; border-radius:12px; }
+    .chip { display:inline-block; padding:6px 10px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.1); border-radius:999px; font-size:0.8rem; margin-right:6px; }
+    .pulse { display:inline-block; width:10px;height:10px;background:#0b84ff;border-radius:50%; animation:pulse 1.2s infinite; }
+    @keyframes pulse { 0%{transform:scale(.8);opacity:.95} 50%{transform:scale(1.35);opacity:.35} 100%{transform:scale(.8);opacity:.95} }
+    """,
+    "Clean Light": """
+    .stApp { background:#f7fafc; color:#0f172a; font-family: Inter, Segoe UI, Roboto, sans-serif; }
+    .card { background:#ffffff; border-radius:16px; padding:16px; box-shadow: 0 10px 30px rgba(2,6,23,0.08); border:1px solid #e5e7eb; }
+    .stat { display:inline-block; padding:10px 14px; margin-right:8px; background:#f8fafc; border-radius:12px; border:1px solid #e5e7eb; }
+    .muted { color:#64748b; } .small { font-size:0.85rem; color:#475569; }
+    button.stButton>button { background: linear-gradient(90deg,#2563eb 0%, #22c55e 100%); color:white; font-weight:600; border-radius:12px; }
+    .chip { display:inline-block; padding:6px 10px; background:#f1f5f9; border:1px solid #e2e8f0; border-radius:999px; font-size:0.8rem; margin-right:6px; }
+    .pulse { display:inline-block; width:10px;height:10px;background:#2563eb;border-radius:50%; animation:pulse 1.2s infinite; }
+    @keyframes pulse { 0%{transform:scale(.8);opacity:.95} 50%{transform:scale(1.35);opacity:.35} 100%{transform:scale(.8);opacity:.95} }
+    """,
+}
+if "theme" not in st.session_state:
+    st.session_state["theme"] = "Ocean Dark"
+st.markdown(f"<style>{THEMES[st.session_state['theme']]}</style>", unsafe_allow_html=True)
 
-        fig = px.histogram(
-        series,
-        x=series,
-        nbins=30,
-        title="Depth distribution",
-        labels={"x": "Depth (m)", "count": "Frequency"},
-        height=350,
-    )
-    _style_plotly_light(fig)
-    return fig
-
-
-
-
-
-def plot_occurrence_map(df):
-    fig, ax = plt.subplots(figsize=(6,4))
-    if "decimalLongitude" in df.columns and "decimalLatitude" in df.columns:
-        ax.scatter(df["decimalLongitude"], df["decimalLatitude"], c="red", s=10, alpha=0.6)
-        ax.set_title("Occurrence Locations")
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-    return fig
-
-
-# --- NetCDF plotting helpers (paste after existing plot functions) ---
-def plot_variable_map_from_ds(ds, var="temperature", time_index=0, depth_index=0):
-    """Return a plotly figure: map (lat/lon) of chosen var at specified time & depth indices."""
-    if var not in ds:
-        return None
-    da = ds[var].isel(time=time_index, depth=depth_index)
-    df = da.to_dataframe(name=var).reset_index()
-    # use px.scatter or px.density_mapbox; keep it simple with scatter
-    fig = px.scatter(df, x="lon", y="lat", color=var, size_max=6,
-                     title=f"{var} (time={ds.time.values[time_index]}, depth={float(ds.depth.values[depth_index])} m)")
-    _style_plotly_light(fig)
-    return fig
-
-def plot_variable_profile_at_point(ds, var="temperature", lon_val=None, lat_val=None, time_index=0):
-    """Return profile (var vs depth) at nearest grid point to lon_val/lat_val."""
-    if var not in ds:
-        return None
-    if lon_val is None or lat_val is None:
-        lon_val = float(ds.lon.mean())
-        lat_val = float(ds.lat.mean())
-    # find nearest indices
-    lon_idx = int(np.abs(ds.lon.values - lon_val).argmin())
-    lat_idx = int(np.abs(ds.lat.values - lat_val).argmin())
-    da = ds[var].isel(time=time_index, lat=lat_idx, lon=lon_idx)
-    prof = pd.DataFrame({"depth": ds.depth.values, var: da.values})
-    fig = px.line(prof, x=var, y="depth", title=f"{var} profile at lon={lon_val:.2f}, lat={lat_val:.2f}")
-    fig.update_yaxes(autorange="reversed")  # depth increasing downward
-    _style_plotly_light(fig)
-    return fig
-
-def plot_variable_timeseries_at_point(ds, var="temperature", lon_val=None, lat_val=None, depth_index=0):
-    """Timeseries of a var at a fixed point & depth."""
-    if var not in ds:
-        return None
-    if lon_val is None or lat_val is None:
-        lon_val = float(ds.lon.mean())
-        lat_val = float(ds.lat.mean())
-    lon_idx = int(np.abs(ds.lon.values - lon_val).argmin())
-    lat_idx = int(np.abs(ds.lat.values - lat_val).argmin())
-    da = ds[var].isel(depth=depth_index, lat=lat_idx, lon=lon_idx)
-    ts = pd.DataFrame({"time": ds.time.values, var: da.values})
-    fig = px.line(ts, x="time", y=var, title=f"{var} timeseries at lon={lon_val:.2f}, lat={lat_val:.2f}, depth={float(ds.depth.values[depth_index])}m")
-    _style_plotly_light(fig)
-    return fig
-
-
-def safe_rerun():
-    """
-    Robust replacement for st.experimental_rerun().
-    Tries public API first, then the internal RerunException, otherwise sets
-    a session flag to force a re-render and asks user to refresh.
-    (No use of deprecated st.experimental_set_query_params.)
-    """
-    try:
-        st.experimental_rerun()
-        return
-    except Exception:
-        pass
-
-    try:
-        # Streamlit internal rerun exception (works in many versions)
-        from streamlit.runtime.scriptrunner import RerunException
-        raise RerunException()
-    except Exception:
-        # Last-ditch: flip a session_state key (forces app to observe a change)
-        try:
-            st.session_state["_force_rerun_ts"] = time.time()
-        except Exception:
-            pass
-        # Inform the user to refresh if everything else fails
-        st.warning("Action completed. If the UI didn't update, please refresh your browser.")
-
-
-
-
-# add near the top, right after imports
-import uuid
-
-def _make_dl_key(base: str, filename: str) -> str:
-    """
-    Create a stable unique widget key for download buttons.
-    Keeps a registry in st.session_state to avoid duplicates.
-    This version is idempotent across reruns: it returns the same key
-    for the same base+filename unless it truly conflicts with an existing key.
-    """
-    safe = (base + "_" + filename).replace(" ", "_").replace("/", "_")
-    safe = safe[:200]
-
-    # ensure _dl_keys exists and is a list
-    existing = st.session_state.get("_dl_keys")
-    if existing is None:
-        st.session_state["_dl_keys"] = []
-        existing = st.session_state["_dl_keys"]
-    if not isinstance(existing, list):
-        existing = list(existing)
-        st.session_state["_dl_keys"] = existing
-
-    # If the exact safe key already exists, return it (idempotent).
-    if safe in existing:
-        return safe
-
-    # If a shorter 'safe' collides with other values, generate a single time suffix
-    if any(s.startswith(safe + "_") for s in existing):
-        safe = f"{safe}_{uuid.uuid4().hex[:8]}"
-
-    existing.append(safe)
-    st.session_state["_dl_keys"] = existing
-    return safe
-
-def _auto_download_pdf_bytes(pdf_bytes: bytes, filename: str):
-    """
-    Auto-trigger browser download of PDF bytes by creating a base64 data URL
-    and auto-clicking an invisible anchor via a small JS snippet.
-    """
-    try:
-        if not isinstance(pdf_bytes, (bytes, bytearray)):
-            # try to coerce
-            pdf_bytes = pdf_bytes.getvalue()
-        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-        # create a minimal HTML snippet that auto-clicks a download link
-        html = f"""
-        <html>
-          <body>
-            <a id="dl" href="data:application/pdf;base64,{b64}" download="{filename}"></a>
-            <script>
-              const a = document.getElementById('dl');
-              if (a) {{
-                // click after a short timeout to let Streamlit render
-                setTimeout(() => a.click(), 50);
-              }}
-            </script>
-          </body>
-        </html>
-        """
-        components.html(html, height=0)
-        return True
-    except Exception as e:
-        print("[WARN] auto-download failed:", e)
-        return False
-
+# ----------- HELPERS (session-safe) -----------
 def _style_plotly_light(fig):
-    """
-    Make a plotly figure clearly visible on a dark page by forcing a light
-    plot background and dark text/axes. Call this on every plotly figure
-    before showing or exporting it.
-    """
     try:
-        if fig is None:
-            return
-        # use the clean white template so colors/lines are visible
         fig.update_layout(
             template="plotly_white",
             paper_bgcolor="white",
             plot_bgcolor="white",
             font=dict(color="#06202a", size=11),
-            legend=dict(bgcolor="rgba(255,255,255,0.95)", bordercolor="#d1d5db", borderwidth=0.5)
+            legend=dict(bgcolor="rgba(255,255,255,0.95)", bordercolor="#d1d5db", borderwidth=0.5),
         )
-        # make axis grids subtle and readable
-        fig.update_xaxes(showgrid=True, gridcolor="#e6eef6", zerolinecolor="#e6eef6",
-                         tickcolor="#06202a", title_font=dict(color="#06202a"))
-        fig.update_yaxes(showgrid=True, gridcolor="#e6eef6", zerolinecolor="#e6eef6",
-                         tickcolor="#06202a", title_font=dict(color="#06202a"))
+        fig.update_xaxes(showgrid=True, gridcolor="#e6eef6", zerolinecolor="#e6eef6", tickcolor="#06202a")
+        fig.update_yaxes(showgrid=True, gridcolor="#e6eef6", zerolinecolor="#e6eef6", tickcolor="#06202a")
     except Exception:
-        # be silent on styling errors so plots still render
         pass
 
+def safe_rerun():
+    try:
+        st.experimental_rerun()
+    except Exception:
+        try:
+            from streamlit.runtime.scriptrunner import RerunException
+            raise RerunException()
+        except Exception:
+            st.session_state["_force_rerun_ts"] = time.time()
+
+try:
+    cache_data = st.cache_data
+except Exception:
+    cache_data = getattr(st, "cache", None) or (lambda **kw: (lambda f: f))
+
+def _make_dl_key(base: str, filename: str) -> str:
+    safe = (base + "_" + filename).replace(" ", "_").replace("/", "_")[:200]
+    st.session_state.setdefault("_dl_keys", [])
+    if safe in st.session_state["_dl_keys"]:
+        return safe
+    if any(s.startswith(safe + "_") for s in st.session_state["_dl_keys"]):
+        safe = f"{safe}_{uuid.uuid4().hex[:8]}"
+    st.session_state["_dl_keys"].append(safe)
+    return safe
 
 def dl_button(container, label, data, file_name, mime, base="dl"):
-    """
-    Wrapper for container.download_button that guarantees a unique key.
-    container can be st (top-level) or a column object (left_col, right_col).
-    """
     key = _make_dl_key(base, file_name)
     return container.download_button(label, data=data, file_name=file_name, mime=mime, key=key)
 
+def _sanitize_value(v):
+    try:
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        if pd.isna(v):
+            return None
+        if isinstance(v, (pd.Timestamp, datetime, date)):
+            return pd.to_datetime(v).isoformat()
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating,)):
+            return float(v)
+        if isinstance(v, (np.bool_,)):
+            return bool(v)
+        if isinstance(v, (bytes, bytearray)):
+            try: return v.decode("utf-8")
+            except Exception: return str(v)
+        return v
+    except Exception:
+        return str(v)
 
-# --- NetCDF dataset generator (paste just before CONFIG) ---
-def generate_ocean_netcdf(outfile_path,
-                          lon_min=68.0, lon_max=96.0,
-                          lat_min=6.0, lat_max=24.0,
-                          nx=40, ny=40,
-                          nt=12, start_date=None,
-                          depths=None, variables=None):
-    """
-    Create a synthetic but physically-plausible NetCDF with dims:
-      time, depth, lat, lon
-    Variables: temperature (C), salinity (PSU), optional others.
-    This function uses xarray to build and save the dataset.
-    """
-    # defaults
-    if start_date is None:
-        start_date = pd.to_datetime(date.today()).normalize()
-    if depths is None:
-        depths = np.array([0, 10, 20, 50, 100, 200])  # m
-    if variables is None:
-        variables = ["temperature", "salinity"]
+def save_df(df: pd.DataFrame, key_prefix="obis"):
+    records = [{k: _sanitize_value(v) for k, v in r.items()} for r in df.to_dict(orient="records")]
+    st.session_state[f"{key_prefix}_records"] = records
+    st.session_state[f"{key_prefix}_columns"] = list(df.columns)
 
-    # coords
-    lons = np.linspace(lon_min, lon_max, nx)
-    lats = np.linspace(lat_min, lat_max, ny)
-    times = pd.date_range(start=start_date, periods=nt, freq="MS")
+def load_df(key_prefix="obis") -> Optional[pd.DataFrame]:
+    recs = st.session_state.get(f"{key_prefix}_records")
+    cols = st.session_state.get(f"{key_prefix}_columns")
+    if recs is None or cols is None:
+        return None
+    df = pd.DataFrame(recs, columns=cols)
+    for dcol in ["eventDate", "time"]:
+        if dcol in df.columns:
+            df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
+    return df
 
-    # build toy fields (you can replace with real profiles later)
-    # shape: (time, depth, lat, lon)
-    shape = (len(times), len(depths), len(lats), len(lons))
-    # Base fields with simple depth & seasonal dependence
-    base_temp = 15.0  # surface baseline
-    temp = np.zeros(shape, dtype=np.float32)
-    salt = np.zeros(shape, dtype=np.float32)
-    for t_idx, t in enumerate(times):
-        # seasonal cycle
-        seasonal = 2.0 * np.sin(2 * np.pi * (t_idx / max(1, nt)))
-        for d_idx, d in enumerate(depths):
-            depth_decay = np.exp(-d / 50.0)  # shallower warmer
-            # add spatial gradients
-            lon_grad = (lons[np.newaxis, :] - lon_min) / (lon_max - lon_min)
-            lat_grad = (lats[:, np.newaxis] - lat_min) / (lat_max - lat_min)
-            grid = (lat_grad[:,:,None] * lon_grad[None,None,:]).astype(np.float32)
-            temp[t_idx, d_idx, :, :] = base_temp + seasonal + 8.0 * depth_decay + 0.5 * grid
-            salt[t_idx, d_idx, :, :] = 35.0 + 0.01 * d + 0.2 * grid  # simple salinity structure
+def _auto_download_pdf_bytes(pdf_bytes: bytes, filename: str):
+    try:
+        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        html_snip = f"""
+        <a id="dl" href="data:application/pdf;base64,{b64}" download="{filename}"></a>
+        <script>setTimeout(()=>document.getElementById('dl').click(), 60);</script>
+        """
+        components.html(html_snip, height=0)
+        return True
+    except Exception:
+        return False
 
-    data_vars = {}
-    if "temperature" in variables:
-        data_vars["temperature"] = (("time","depth","lat","lon"), temp)
-    if "salinity" in variables:
-        data_vars["salinity"] = (("time","depth","lat","lon"), salt)
+# ----------- NAME ROUTING (Common → Scientific) -----------
+BINOMIAL_RE = re.compile(r"^[A-Z][a-zA-Z-]+ [a-z][a-zA-Z-]+$")
 
-    coords = {
-        "time": times,
-        "depth": depths,
-        "lat": lats,
-        "lon": lons
-    }
-    ds = xr.Dataset(data_vars=data_vars, coords=coords)
-    # add basic metadata
-    ds.attrs["title"] = "FloatChat generated ocean dataset"
-    ds.attrs["created_by"] = "FloatChat"
-    # save NetCDF
-    ds.to_netcdf(outfile_path)
-    return ds
+def looks_binomial(name: str) -> bool:
+    return bool(BINOMIAL_RE.match(name.strip()))
 
+@cache_data(ttl=60*60)
+def gbif_resolve(name: str) -> Optional[str]:
+    # Try suggest endpoint first
+    try:
+        r = requests.get("https://api.gbif.org/v1/species/suggest", params={"q": name, "limit": 1}, timeout=15)
+        if r.ok and isinstance(r.json(), list) and r.json():
+            sci = r.json()[0].get("scientificName")
+            if sci: return sci
+    except Exception:
+        pass
+    # Fallback to match
+    try:
+        r = requests.get("https://api.gbif.org/v1/species/match", params={"name": name}, timeout=15)
+        if r.ok:
+            j = r.json()
+            if isinstance(j, dict):
+                sci = j.get("scientificName")
+                if sci: return sci
+    except Exception:
+        pass
+    return None
 
+@cache_data(ttl=60*60)
+def worms_resolve(name: str) -> Optional[str]:
+    try:
+        r = requests.get(f"https://www.marinespecies.org/rest/AphiaRecordsByName/{requests.utils.quote(name)}?like=true&marine_only=true", timeout=15)
+        if r.ok and isinstance(r.json(), list) and r.json():
+            sci = r.json()[0].get("scientificname")
+            if sci: return sci
+    except Exception:
+        pass
+    return None
 
-# -----------------------------
-# CONFIG (your provided key)
-# -----------------------------
-OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
+def resolve_common_to_scientific(query: str) -> Tuple[str, str]:
+    """Return (scientific_name, provenance)"""
+    q = query.strip()
+    if looks_binomial(q):
+        return q, "User provided binomial"
+    # GBIF first
+    sci = gbif_resolve(q)
+    if sci: return sci, "Resolved via GBIF"
+    # WoRMS fallback
+    sci = worms_resolve(q)
+    if sci: return sci, "Resolved via WoRMS"
+    # Heuristic: title-case first two words
+    parts = q.split()
+    if len(parts) >= 2:
+        return f"{parts[0].capitalize()} {parts[1].lower()}", "Heuristic guess"
+    return q, "Unchanged"
 
-OBIS_API_URL = "https://api.obis.org/v3/occurrence"
-
-# -----------------------------
-# Page / CSS (dark theme restored)
-# -----------------------------
-st.set_page_config(
-    page_title="FloatChat | AI-Powered ARGO Ocean Data Discovery & Visualization",
-    page_icon="🌊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Show title and description inside the app
-st.title("FloatChat: AI-Powered ARGO Ocean Data Discovery & Visualization")
-
-st.markdown(
-    """
-    **FloatChat** is an AI-powered interface that makes ARGO ocean data simple to explore.  
-    Ask questions in plain language and get instant insights on temperature, salinity, 
-    and biogeochemical variables — no complex tools required.
-    """
-)
-
-# inside your main UI function (after st.set_page_config or st.title etc.)
-erddap_streamlit_widget()
-
-
-st.markdown(
-    """
-    <style>
-    /* page bg and card (dark theme restored) */
-    .reportview-container, .stApp {
-        background: linear-gradient(180deg,#071022 0%, #081526 45%, #0b2b3a 100%);
-        color: #e6f0f6;
-        font-family: "Inter", "Segoe UI", Roboto, sans-serif;
-    }
-    /* card look for st.card containers */
-    .card {
-        background: rgba(255,255,255,0.03);
-        border-radius: 12px;
-        padding: 16px;
-        box-shadow: 0 6px 18px rgba(2,6,23,0.6);
-        border: 1px solid rgba(255,255,255,0.03);
-    }
-    h1, h2, h3, .css-1v3fvcr {
-        color: #e6f0f6;
-    }
-    /* small subtle button hover */
-    button.stButton>button {
-        background: linear-gradient(90deg,#0b84ff 0%, #6ee7b7 100%);
-        color: #06202a;
-        font-weight: 600;
-        border-radius: 10px;
-    }
-    /* loading pulse */
-    .pulse {
-        display:inline-block;
-        width:12px;
-        height:12px;
-        background:#0b84ff;
-        border-radius:50%;
-        animation:pulse 1.4s infinite;
-    }
-    @keyframes pulse {
-        0% { transform: scale(0.8); opacity: 0.9; }
-        50% { transform: scale(1.4); opacity: 0.4; }
-        100% { transform: scale(0.8); opacity: 0.9; }
-    }
-    .muted { color: #9fb7c7; font-size: 0.95rem; }
-    .small { font-size: 0.85rem; color:#bcd7e6; }
-    .stat {
-        display:inline-block;
-        padding:10px 14px;
-        margin-right:8px;
-        background: rgba(255,255,255,0.02);
-        border-radius:10px;
-        border:1px solid rgba(255,255,255,0.02);
-    }
-    .top-row { display:flex; gap:12px; align-items:center; }
-    </style>
-    """, unsafe_allow_html=True
-)
-
-# -----------------------------
-# Sidebar controls (non-text only)
-# -----------------------------
-with st.sidebar:
-    st.markdown("## Controls")
-    max_records = st.slider("Max records to fetch", min_value=10, max_value=1000, value=200, step=10)
-    bbox_enable = st.checkbox("Filter by bounding box (lon/lat)", value=False)
-    if bbox_enable:
-        lon_min = st.number_input("Lon min", value=68.0, step=0.1, format="%.3f")
-        lon_max = st.number_input("Lon max", value=96.0, step=0.1, format="%.3f")
-        lat_min = st.number_input("Lat min", value=6.0, step=0.1, format="%.3f")
-        lat_max = st.number_input("Lat max", value=24.0, step=0.1, format="%.3f")
-
-    st.markdown("---")
-    st.markdown("## Date range (optional)")
-    start_date = st.date_input("Start date", value=date(2000, 1, 1))
-    end_date = st.date_input("End date", value=date.today())
-    if start_date and end_date and start_date > end_date:
-        st.warning("Start date is after end date — results will be empty until corrected.")
-
-    # --- NetCDF generation controls (add into the sidebar block) ---
-    st.markdown("---")
-    st.markdown("## Generate NetCDF dataset (synthetic)")
-    gen_enable = st.checkbox("Enable NetCDF generator", value=False)
-    if gen_enable:
-        nc_nx = st.number_input("Longitude points (nx)", min_value=8, max_value=400, value=40, step=8)
-        nc_ny = st.number_input("Latitude points (ny)", min_value=8, max_value=400, value=40, step=8)
-        nc_nt = st.number_input("Time steps (nt)", min_value=1, max_value=48, value=12)
-        nc_depths_str = st.text_input("Depths (comma-separated, meters)", value="0,10,20,50,100,200")
-        nc_vars = st.multiselect("Variables", ["temperature","salinity","oxygen","nitrate"], default=["temperature","salinity"])
-
-
-    
-    st.markdown("---")
-    st.markdown("### OpenRouter / LLM")
-    st.markdown(f"**Model:** {OPENROUTER_MODEL}")
-    st.markdown("<div class='small muted'>Using your OpenRouter key (provided).</div>", unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown("Advanced")
-    auto_summary = st.checkbox("Auto-summarize after successful fetch", value=True)
-    st.markdown("Built for FloatChat — IndOBIS + AI")
-
-# -----------------------------
-# Helper functions
-# -----------------------------
+# ----------- OBIS INTEGRATION -----------
 @cache_data(ttl=60 * 30)
-def fetch_obis_records(species_name: str, size: int = 100, bbox: Optional[dict] = None):
-
-    """
-    Fetch OBIS records. Convert bbox into a stable tuple (hashable) so Streamlit's cache can
-    safely include the bbox in the cache key.
-    """
-    # Turn bbox dict into a hashable tuple (lonmin, lonmax, latmin, latmax) if provided
-    bbox_tuple = None
-    if isinstance(bbox, dict):
-        try:
-            bbox_tuple = (
-                float(bbox.get("lonmin")),
-                float(bbox.get("lonmax")),
-                float(bbox.get("latmin")),
-                float(bbox.get("latmax")),
-            )
-        except Exception:
-            bbox_tuple = None
-    elif isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-        bbox_tuple = tuple(bbox)
-
-    params = {"scientificname": species_name, "size": size}
-    if bbox_tuple:
-        lonmin, lonmax, latmin, latmax = bbox_tuple
-        poly = f"POLYGON(({lonmin} {latmin}, {lonmax} {latmin}, {lonmax} {latmax}, {lonmin} {latmax}, {lonmin} {latmin}))"
+def fetch_obis_records(species_name: str, size: int = 200, bbox: Optional[Dict] = None) -> pd.DataFrame:
+    params = {"scientificname": species_name, "size": int(size)}
+    if bbox and all(k in bbox for k in ("lonmin", "lonmax", "latmin", "latmax")):
+        poly = f"POLYGON(({bbox['lonmin']} {bbox['latmin']}, {bbox['lonmax']} {bbox['latmin']}, {bbox['lonmax']} {bbox['latmax']}, {bbox['lonmin']} {bbox['latmax']}, {bbox['lonmin']} {bbox['latmin']}))"
         params["geometry"] = poly
-
     r = requests.get(OBIS_API_URL, params=params, timeout=40)
     r.raise_for_status()
     js = r.json()
-    results = js.get("results", [])
-    return pd.DataFrame(results)
+    return pd.DataFrame(js.get("results", []))
 
-
-
-def ask_openrouter(messages: list, model=OPENROUTER_MODEL, timeout=60):
-    """
-    Safe wrapper for OpenRouter calls.
-    Returns: string response (or an error message string) — never raises.
-    """
-    if not OPENROUTER_API_KEY:
-        return "OpenRouter API key not configured. Set OPENROUTER_API_KEY in environment or st.secrets."
-
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "max_tokens": 800, "temperature": 0.2}
-    try:
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        j = resp.json()
-        # Try common response shapes safely
-        if isinstance(j, dict):
-            # new-style: choices -> [ { "message": {"content": "..."} } ]
-            choices = j.get("choices")
-            if isinstance(choices, list) and choices:
-                first = choices[0]
-                if isinstance(first, dict):
-                    # OpenRouter (or chat-like) shape
-                    msg = first.get("message") or first.get("delta") or first
-                    if isinstance(msg, dict):
-                        content = msg.get("content") or msg.get("text")
-                        if isinstance(content, str):
-                            return content
-                    # fallback if first has 'text'
-                    if "text" in first and isinstance(first["text"], str):
-                        return first["text"]
-            # older shape: 'text' at top-level
-            if "text" in j and isinstance(j["text"], str):
-                return j["text"]
-        # fallback: return pretty json so user sees API response
-        return json.dumps(j, indent=2)
-    except requests.exceptions.HTTPError as he:
-        return f"AI HTTP error: {he}"
-    except requests.exceptions.RequestException as re:
-        return f"AI request error: {re}"
-    except Exception as e:
-        return f"AI unknown error: {e}"
-
-
-
-def interpret_input_via_ai(user_text: str, model=OPENROUTER_MODEL, timeout=20):
-    system = {
-        "role": "system",
-        "content": (
-            "You are a routing assistant. Given a single-line user input, return ONLY a one-line JSON object with exactly one of the two shapes:\n"
-            '{"action":"search","species":"Genus species"} OR {"action":"ai","query":"..."}\n'
-            "If you can identify a scientific name (Genus species), put it in 'species'. If unsure, return action 'ai'. Output pure JSON only."
-        )
-    }
-    user = {"role": "user", "content": f"User input: \"{user_text}\""}
-    try:
-        reply = ask_openrouter([system, user], model=model, timeout=timeout)
-        txt = reply.strip()
-        if txt.startswith("```"):
-            txt = txt.strip("`").strip()
-        start = txt.find("{"); end = txt.rfind("}")
-        if start != -1 and end != -1:
-            txt_json = txt[start:end+1]
-            parsed = json.loads(txt_json)
-            if "action" in parsed and parsed["action"] in ("search","ai"):
-                if parsed.get("action") == "search":
-                    sp = parsed.get("species", "")
-                    if isinstance(sp, str):
-                        parsed["species"] = sp.strip()
-                return parsed
-    except Exception:
-        pass
-
-    # fallback: binomial detection
-    words = user_text.strip().split()
-    if len(words) >= 2 and words[0][0].isupper():
-        return {"action":"search", "species":" ".join(words[:2])}
-    return {"action":"ai", "query": user_text}
-
-
-def ai_summarize_records(df: pd.DataFrame, species_name: str):
-    sample = df.head(30).to_dict(orient="records")
-    system_msg = {
-        "role": "system",
-        "content": "You are a marine biology data assistant. Interpret species occurrence records and provide concise, non-technical summaries."
-    }
-    user_msg = {
-        "role": "user",
-        "content": f"I have {len(df)} occurrence records for '{species_name}'. Sample (up to 30 rows): {sample}\n\nPlease produce 3-6 bullet points summarizing distribution, notable patterns, and one recommended next-step analysis."
-    }
-    try:
-        reply = ask_openrouter([system_msg, user_msg])
-        return reply
-    except Exception as e:
-        return f"AI summarization failed: {e}"
-
-
-def prepare_csv_download(df: pd.DataFrame):
-    buf = StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue()
-
-
-def prepare_excel_download(df: pd.DataFrame):
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="records")
-    return buf.getvalue()
-
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
-
-def prepare_pdf_download(df: pd.DataFrame, title="OBIS Report"):
-    """Return PDF bytes for download, including a small sample table."""
-    buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=(595, 842))  # A4 portrait approx
-    styles = getSampleStyleSheet()
-    story = []
-
-    story.append(Paragraph(title, styles["Title"]))
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
-    story.append(Paragraph(f"Total records: {len(df)}", styles["Normal"]))
-    story.append(Spacer(1, 12))
-
-    # Build a simple table for the first N rows
-    preview = df.head(20)
-    if preview.empty:
-        story.append(Paragraph("No records to show.", styles["Normal"]))
-    else:
-        # choose up to 6 columns to keep PDF readable
-        cols = [c for c in ["scientificName", "eventDate", "decimalLongitude", "decimalLatitude", "depth", "basisOfRecord"] if c in preview.columns]
-        if not cols:
-            cols = list(preview.columns[:6])
-        data = [cols]
-        for _, row in preview.iterrows():
-            data.append([("" if pd.isna(row.get(c, "")) else str(row.get(c, ""))[:90]) for c in cols])
-
-        # small table style
-        tbl = Table(data, repeatRows=1, hAlign="LEFT")
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0b84ff")),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-            ("FONTSIZE", (0,0), (-1,-1), 8),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#d1d5db")),
-            ("LEFTPADDING", (0,0), (-1,-1), 4),
-            ("RIGHTPADDING", (0,0), (-1,-1), 4),
-        ]))
-        story.append(tbl)
-
-    doc.build(story)
-    pdf_bytes = buf.getvalue()
-    buf.close()
-    return pdf_bytes
-
-
-
-def make_plots_from_df(df: pd.DataFrame, species_name: str):
-    """Return a dict of plotly figures (map, timeseries, depth hist, density)
-    and additional measurement plots (temperature, salinity) if those fields exist.
-    This preserves all pre-existing plots and adds measurement plots (no other code changed).
-    """
+def make_plots_from_df(df: pd.DataFrame, species_name: str) -> Dict[str, Any]:
     figs = {}
-
-    # ----- Map scatter (same logic as before) -----
-    if "decimalLongitude" in df.columns and "decimalLatitude" in df.columns:
+    if {"decimalLongitude", "decimalLatitude"}.issubset(df.columns):
         map_df = df.dropna(subset=["decimalLongitude", "decimalLatitude"])
-        sample_map = map_df if len(map_df) <= 1000 else map_df.sample(1000, random_state=1)
-        figs["map"] = px.scatter_geo(
+        sample_map = map_df if len(map_df) <= 1500 else map_df.sample(1500, random_state=1)
+        f = px.scatter_geo(
             sample_map,
             lon="decimalLongitude",
             lat="decimalLatitude",
@@ -756,900 +276,897 @@ def make_plots_from_df(df: pd.DataFrame, species_name: str):
             hover_data=[c for c in ["eventDate", "depth"] if c in sample_map.columns],
             title=f"{species_name} occurrences (sample)",
             projection="natural earth",
-            height=550,
+            height=560,
         )
-        figs["map"].update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"))
-        _style_plotly_light(figs["map"])
+        f.update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"))
+        _style_plotly_light(f)
+        figs["map"] = f
 
-    # ----- Time series (yearly / monthly counts) -----
     if "eventDate" in df.columns:
         try:
-            df["eventDate_parsed"] = pd.to_datetime(df["eventDate"], errors="coerce")
-            times = df.dropna(subset=["eventDate_parsed"]).copy()
-            if not times.empty:
-                times["year"] = times["eventDate_parsed"].dt.year
-                times["month"] = times["eventDate_parsed"].dt.to_period("M").astype(str)
-                yearly = times.groupby("year").size().reset_index(name="count")
-                figs["yearly"] = px.bar(yearly, x="year", y="count", title="Records per year", height=300)
-                _style_plotly_light(figs["yearly"])
-                monthly = times.groupby("month").size().reset_index(name="count").sort_values("month")
-                figs["monthly"] = px.line(monthly, x="month", y="count", title="Records per month (period)", height=300)
-                _style_plotly_light(figs["monthly"])
+            dft = df.copy()
+            dft["eventDate"] = pd.to_datetime(dft["eventDate"], errors="coerce")
+            t = dft.dropna(subset=["eventDate"])
+            if not t.empty:
+                yearly = t.groupby(t["eventDate"].dt.year).size().reset_index(name="count")
+                fy = px.bar(yearly, x="eventDate", y="count", title="Records per year", height=300)
+                _style_plotly_light(fy)
+                figs["yearly"] = fy
+                monthly = t.groupby(t["eventDate"].dt.to_period("M")).size().reset_index(name="count")
+                monthly["eventMonth"] = monthly["eventDate"].astype(str)
+                fm = px.line(monthly, x="eventMonth", y="count", title="Records per month", height=300)
+                _style_plotly_light(fm)
+                figs["monthly"] = fm
         except Exception:
-            # keep original behavior: don't break on time parsing errors
             pass
 
-    # ----- Depth distribution (same logic) -----
     if "depth" in df.columns:
         try:
-            df_depth = df.dropna(subset=["depth"]).copy()
-            if not df_depth.empty:
-                depth_nums = pd.to_numeric(df_depth["depth"], errors="coerce").dropna()
-                if not depth_nums.empty:
-                    figs["depth_hist"] = px.histogram(depth_nums, x=depth_nums, nbins=30,
-                                                     title="Depth distribution", labels={"x": "Depth (m)", "count": "Frequency"}, height=300)
-                    _style_plotly_light(figs["depth_hist"])
-        except Exception as e:
-            print("[WARN] depth plot failed:", e)
+            d = pd.to_numeric(df["depth"], errors="coerce").dropna()
+            if not d.empty:
+                fd = px.histogram(d, x=d, nbins=30, title="Depth distribution", labels={"x": "Depth (m)", "count": "Frequency"}, height=300)
+                _style_plotly_light(fd)
+                figs["depth_hist"] = fd
+        except Exception:
+            pass
 
-    # ----- Density heatmap (lon/lat) (same logic) -----
-    if "decimalLongitude" in df.columns and "decimalLatitude" in df.columns:
+    if {"decimalLongitude", "decimalLatitude"}.issubset(df.columns):
         try:
             heat_df = df.dropna(subset=["decimalLongitude", "decimalLatitude"])
             if len(heat_df) >= 20:
-                figs["density"] = px.density_heatmap(
-                    heat_df, x="decimalLongitude", y="decimalLatitude", nbinsx=60, nbinsy=40,
-                    title="Density heatmap (lon/lat)", height=400
-                )
-                figs["density"].update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                fh = px.density_heatmap(heat_df, x="decimalLongitude", y="decimalLatitude", nbinsx=60, nbinsy=40,
+                                        title="Density heatmap (lon/lat)", height=400)
+                _style_plotly_light(fh)
+                figs["density"] = fh
         except Exception:
             pass
 
-    # ----- NEW: measurement detection helpers -----
-    # Common column name variants we try to support
-    TEMP_COLS = [
-        "temperature", "temp", "sea_temperature", "sea_temp", "water_temperature", "water_temp", "t"
-    ]
-    SAL_COLS = [
-        "salinity", "psal", "psal_ctd", "salt"
-    ]
-    # Generic function to find first matching column in list
-    def _find_col(candidates):
-        for c in candidates:
-            if c in df.columns:
-                return c
-        # Also try case-insensitive match for robustness
-        lower_map = {col.lower(): col for col in df.columns}
-        for c in candidates:
-            if c.lower() in lower_map:
-                return lower_map[c.lower()]
+    # Optional: measurement plots (auto-detect)
+    def _find(cands):  # case-insensitive match
+        lowmap = {c.lower(): c for c in df.columns}
+        for c in cands:
+            if c in df.columns: return c
+            if c.lower() in lowmap: return lowmap[c.lower()]
         return None
+    temp_col = _find(["temperature", "temp", "water_temperature", "t", "sea_temperature"])
+    sal_col = _find(["salinity", "psal", "salt", "psal_ctd"])
 
-    temp_col = _find_col(TEMP_COLS)
-    sal_col = _find_col(SAL_COLS)
-
-    # ----- NEW: Temperature plots (timeseries + distribution + summary) -----
     if temp_col is not None:
-        try:
-            series_temp = pd.to_numeric(df[temp_col].dropna(), errors="coerce").dropna()
-            if not series_temp.empty:
-                # Distribution / histogram
-                figs["temperature_hist"] = px.histogram(series_temp, x=series_temp, nbins=40,
-                                                        title=f"Temperature distribution ({temp_col})", labels={"x": "Temperature (°C)", "count": "Frequency"}, height=300)
-                _style_plotly_light(figs["temperature_hist"])
+        s = pd.to_numeric(df[temp_col], errors="coerce").dropna()
+        if not s.empty:
+            ft = px.histogram(s, x=s, nbins=40, title=f"Temperature distribution ({temp_col})", labels={"x": "Temperature (°C)"}, height=300)
+            _style_plotly_light(ft); figs["temperature_hist"] = ft
+        if "eventDate" in df.columns:
+            tts = df.dropna(subset=[temp_col, "eventDate"]).copy()
+            tts[temp_col] = pd.to_numeric(tts[temp_col], errors="coerce")
+            tts = tts.dropna(subset=[temp_col])
+            if not tts.empty:
+                ftts = px.line(tts.sort_values("eventDate"), x="eventDate", y=temp_col, title=f"Temperature time series ({temp_col})", height=300)
+                _style_plotly_light(ftts); figs["temperature_ts"] = ftts
 
-                # If eventDate exists and is parseable, create a timeseries
-                if "eventDate_parsed" not in df.columns and "eventDate" in df.columns:
-                    try:
-                        df["eventDate_parsed"] = pd.to_datetime(df["eventDate"], errors="coerce")
-                    except Exception:
-                        pass
-                if "eventDate_parsed" in df.columns and df["eventDate_parsed"].notna().any():
-                    t_ts = df.dropna(subset=[temp_col, "eventDate_parsed"]).copy()
-                    t_ts[temp_col] = pd.to_numeric(t_ts[temp_col], errors="coerce")
-                    t_ts = t_ts.dropna(subset=[temp_col])
-                    if not t_ts.empty:
-                        figs["temperature_ts"] = px.line(t_ts.sort_values("eventDate_parsed"),
-                                                         x="eventDate_parsed", y=temp_col,
-                                                         title=f"Temperature time series ({temp_col})", height=300)
-                        _style_plotly_light(figs["temperature_ts"])
-
-                # Summary stats (kept in figs as a small dict for optional display)
-                temp_stats = {
-                    "count": int(series_temp.count()),
-                    "mean": float(series_temp.mean()),
-                    "median": float(series_temp.median()),
-                    "min": float(series_temp.min()),
-                    "max": float(series_temp.max()),
-                    "col_name": temp_col
-                }
-                figs["temperature_summary"] = temp_stats
-        except Exception as e:
-            print("[WARN] temperature plotting failed:", e)
-
-    # ----- NEW: Salinity plots (timeseries + distribution + summary) -----
     if sal_col is not None:
-        try:
-            series_sal = pd.to_numeric(df[sal_col].dropna(), errors="coerce").dropna()
-            if not series_sal.empty:
-                figs["salinity_hist"] = px.histogram(series_sal, x=series_sal, nbins=40,
-                                                     title=f"Salinity distribution ({sal_col})", labels={"x": "Salinity (PSU)", "count": "Frequency"}, height=300)
-                _style_plotly_light(figs["salinity_hist"])
+        s = pd.to_numeric(df[sal_col], errors="coerce").dropna()
+        if not s.empty:
+            fs = px.histogram(s, x=s, nbins=40, title=f"Salinity distribution ({sal_col})", labels={"x": "Salinity (PSU)"}, height=300)
+            _style_plotly_light(fs); figs["salinity_hist"] = fs
+        if "eventDate" in df.columns:
+            sts = df.dropna(subset=[sal_col, "eventDate"]).copy()
+            sts[sal_col] = pd.to_numeric(sts[sal_col], errors="coerce")
+            sts = sts.dropna(subset=[sal_col])
+            if not sts.empty:
+                fsts = px.line(sts.sort_values("eventDate"), x="eventDate", y=sal_col, title=f"Salinity time series ({sal_col})", height=300)
+                _style_plotly_light(fsts); figs["salinity_ts"] = fsts
 
-                # timeseries if dates available
-                if "eventDate_parsed" not in df.columns and "eventDate" in df.columns:
-                    try:
-                        df["eventDate_parsed"] = pd.to_datetime(df["eventDate"], errors="coerce")
-                    except Exception:
-                        pass
-                if "eventDate_parsed" in df.columns and df["eventDate_parsed"].notna().any():
-                    s_ts = df.dropna(subset=[sal_col, "eventDate_parsed"]).copy()
-                    s_ts[sal_col] = pd.to_numeric(s_ts[sal_col], errors="coerce")
-                    s_ts = s_ts.dropna(subset=[sal_col])
-                    if not s_ts.empty:
-                        figs["salinity_ts"] = px.line(s_ts.sort_values("eventDate_parsed"),
-                                                      x="eventDate_parsed", y=sal_col,
-                                                      title=f"Salinity time series ({sal_col})", height=300)
-                        _style_plotly_light(figs["salinity_ts"])
-
-                sal_stats = {
-                    "count": int(series_sal.count()),
-                    "mean": float(series_sal.mean()),
-                    "median": float(series_sal.median()),
-                    "min": float(series_sal.min()),
-                    "max": float(series_sal.max()),
-                    "col_name": sal_col
-                }
-                figs["salinity_summary"] = sal_stats
-        except Exception as e:
-            print("[WARN] salinity plotting failed:", e)
-
-    # ----- Return all figs (existing keys preserved; new keys added) -----
     return figs
 
+def prepare_csv_download(df: pd.DataFrame) -> str:
+    buf = StringIO(); df.to_csv(buf, index=False); return buf.getvalue()
 
+def prepare_excel_download(df: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="records")
+    return buf.getvalue()
 
-
-def generate_pdf_report(df: pd.DataFrame, species_name: str, summary_text: str, figs: dict):
-    """
-    Professional PDF report generator:
-    - Uses reportlab + kaleido (plotly -> png)
-    - Includes title, metadata, AI summary, images (map/plots), and a clean table
-    Returns: bytes of the generated PDF.
-    """
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, 
-        Table, TableStyle, PageBreak
-    )
+def generate_pdf_report(df: pd.DataFrame, species_name: str, summary_text: str, figs: Dict[str, Any]) -> bytes:
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image as RLImage
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
 
-    # Helper: convert plotly figs -> png bytes
-        # Helper: convert plotly figs -> png bytes (try kaleido explicitly, fallback gracefully)
-    image_items = []
-    for key in ["map", "yearly", "monthly", "depth_hist", "density"]:
+    images = []
+    for key in ["map", "yearly", "monthly", "depth_hist", "density", "temperature_hist", "salinity_hist"]:
         if key in figs:
             try:
-                # prefer kaleido explicitly (more reliable if installed)
-                img_bytes = pio.to_image(figs[key], format="png", scale=2, engine="kaleido")
-                image_items.append((key, img_bytes))
-            except Exception as e_k:
-                # try without specifying engine (let plotly choose), but capture error
+                images.append((key, pio.to_image(figs[key], format="png", scale=2, engine="kaleido")))
+            except Exception:
                 try:
-                    img_bytes = pio.to_image(figs[key], format="png", scale=2)
-                    image_items.append((key, img_bytes))
-                except Exception as e:
-                    # final fallback: no image for this figure, but surface a warning in server logs
-                    print(f"[WARN] Could not render {key} with kaleido: {e_k}; fallback also failed: {e}")
-                    image_items.append((key, None))
-
+                    images.append((key, pio.to_image(figs[key], format="png", scale=2)))
+                except Exception:
+                    images.append((key, None))
 
     buf = BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40
-    )
-
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], fontSize=18, leading=22))
     styles.add(ParagraphStyle(name="Meta", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#6b7280")))
     styles.add(ParagraphStyle(name="Heading", parent=styles["Heading2"], fontSize=12, leading=14))
     styles.add(ParagraphStyle(name="NormalSmall", parent=styles["Normal"], fontSize=10, leading=12))
-
     story = []
 
-    # Title & metadata
-    report_title = f"OBIS Report — {species_name}" if species_name else "OBIS Report"
-    story.append(Paragraph(report_title, styles["ReportTitle"]))
+    title = f"OBIS Report — {species_name}" if species_name else "OBIS Report"
+    story.append(Paragraph(title, styles["ReportTitle"]))
     story.append(Spacer(1, 6))
-    meta_lines = [
-        f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"Total records: {len(df)}"
-    ]
-    for m in meta_lines:
-        story.append(Paragraph(m, styles["Meta"]))
-    story.append(Spacer(1, 12))
-
-    # AI Summary
+    story.append(Paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", styles["Meta"]))
+    story.append(Paragraph(f"Total records: {len(df)}", styles["Meta"]))
+    story.append(Spacer(1, 10))
     story.append(Paragraph("AI Summary", styles["Heading"]))
     if summary_text:
-        for paragraph in str(summary_text).split("\n\n"):
-            story.append(Paragraph(paragraph.replace("\n", "<br/>"), styles["NormalSmall"]))
-            story.append(Spacer(1, 6))
+        for para in str(summary_text).split("\n\n"):
+            story.append(Paragraph(para.replace("\n", "<br/>"), styles["NormalSmall"]))
+            story.append(Spacer(1, 4))
     else:
         story.append(Paragraph("No AI summary available.", styles["NormalSmall"]))
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 8))
 
-    # Images
-    max_img_width = doc.width
-    for title, img_bytes in image_items:
+    maxw = 515  # approx doc.width
+    for title, img_bytes in images:
         if img_bytes:
             img_io = BytesIO(img_bytes)
             img = RLImage(img_io)
-            img.drawWidth = max_img_width
-            img.drawHeight = max_img_width * (img.imageHeight / float(img.imageWidth))
+            img.drawWidth = maxw
+            img.drawHeight = maxw * (img.imageHeight / float(img.imageWidth))
             story.append(Paragraph(title.replace("_", " ").title(), styles["Heading"]))
-            story.append(Spacer(1, 6))
             story.append(img)
-            story.append(Spacer(1, 12))
+            story.append(Spacer(1, 10))
 
     story.append(PageBreak())
-
-    # Table (first 100 rows, important cols)
-    story.append(Paragraph("Sample Records (first 100 rows)", styles["Heading"]))
-    story.append(Spacer(1, 6))
-
-    preferred_cols = ["scientificName", "eventDate", "decimalLongitude", "decimalLatitude", "depth", "basisOfRecord", "institutionCode"]
-    cols = [c for c in preferred_cols if c in df.columns] or list(df.columns[:6])
-    display_rows = df.head(100)
-
-    def fmt(val):
-        if pd.isna(val): return ""
-        s = str(val)
-        return s[:77] + "..." if len(s) > 80 else s
-
-    data_table = [cols] + [[fmt(r.get(c, "")) for c in cols] for _, r in display_rows.iterrows()]
-    colWidths = [doc.width / len(cols)] * len(cols)
-
-    table = Table(data_table, colWidths=colWidths, repeatRows=1)
-    style = TableStyle([
+    story.append(Paragraph("Sample Records (first 100)", styles["Heading"]))
+    preferred = ["scientificName", "eventDate", "decimalLongitude", "decimalLatitude", "depth", "basisOfRecord", "institutionCode"]
+    cols = [c for c in preferred if c in df.columns] or list(df.columns[:6])
+    display = df.head(100)
+    def fmt(v): 
+        if pd.isna(v): return ""
+        s = str(v);  return (s[:77] + "...") if len(s) > 80 else s
+    data = [cols] + [[fmt(r.get(c, "")) for c in cols] for _, r in display.iterrows()]
+    from reportlab.platypus import Table
+    table = Table(data, colWidths=[maxw/len(cols)]*len(cols), repeatRows=1)
+    table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0b84ff")),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("ALIGN", (0,0), (-1,-1), "LEFT"),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
         ("FONTSIZE", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,0), 6),
         ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#d1d5db")),
-    ])
-    for i in range(1, len(data_table)):
-        if i % 2 == 0:
-            style.add("BACKGROUND", (0,i), (-1,i), colors.HexColor("#f8fafc"))
-    table.setStyle(style)
-
+    ]))
     story.append(table)
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("Generated by FloatChat — IndOBIS + AI", styles["Meta"]))
 
-    def _add_page_number(canvas, doc):
-        page_num = canvas.getPageNumber()
-        canvas.setFont("Helvetica", 8)
-        canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 12, f"Page {page_num}")
-
-    doc.build(story, onFirstPage=_add_page_number, onLaterPages=_add_page_number)
+    def _pgnum(c, d): c.setFont("Helvetica",8); c.drawRightString(d.pagesize[0]-d.rightMargin, 12, f"Page {c.getPageNumber()}")
+    doc.build(story, onFirstPage=_pgnum, onLaterPages=_pgnum)
     buf.seek(0)
     return buf.getvalue()
 
+# ----------- AI (OpenRouter) -----------
+def ask_openrouter(messages: List[Dict[str, str]], model=OPENROUTER_MODEL, timeout=60) -> str:
+    if not OPENROUTER_API_KEY:
+        return "Set OPENROUTER_API_KEY in Streamlit secrets or environment to enable AI."
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "max_tokens": 700, "temperature": 0.2}
+    try:
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        j = resp.json()
+        ch = (j.get("choices") or [{}])[0]
+        msg = ch.get("message") or ch.get("delta") or {}
+        return msg.get("content") or ch.get("text") or json.dumps(j)[:2000]
+    except Exception as e:
+        return f"AI error: {e}"
 
-# -----------------------------
-# MAIN UI: single input box only
-# -----------------------------
-st.markdown(
-            "<div class='muted'>Type anything: a species name (e.g., 'Sardinella longiceps') or a question. </div></div>", unsafe_allow_html=True)
+def ai_summarize_records(df: pd.DataFrame, species_name: str) -> str:
+    sample = df.head(30).to_dict(orient="records")
+    system = {"role": "system", "content": "You are a marine biology data assistant. Summarize non-technically."}
+    user = {"role": "user", "content": f"I have {len(df)} records for '{species_name}'. Sample: {sample}. Provide 3–6 bullets on distribution/patterns + one next-step analysis."}
+    return ask_openrouter([system, user])
 
-# Single-line input inside a form so pressing Enter submits immediately
-with st.form(key="single_input_form", clear_on_submit=False):
-    user_input = st.text_input("Enter species name or a question ", value="", key="single_input")
-    submit = st.form_submit_button("Submit")
+# ----------- ERDDAP (inlined core from your module) -----------
+def _format_iso(dt: datetime) -> str:
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
-# Some Streamlit versions do not accept the `gap` parameter.
-try:
-    left_col, right_col = st.columns([2.4, 1.0], gap="large")
-except TypeError:
-    left_col, right_col = st.columns([2.4, 1.0])
-
-
-# Always render cached OBIS data (so it won't disappear after other interactions)
-with left_col:
-    # use load_obis_df() to robustly reconstruct the DataFrame from session_state
-    df_prev = load_obis_df()
-    if df_prev is not None and not df_prev.empty:
-
-        st.markdown("### Previously fetched OBIS records (cached)")
-        st.markdown(f"<div class='small muted'>Showing {len(df_prev)} cached records — use 'Clear cached data' to remove.</div>", unsafe_allow_html=True)
-
+def geocode_place(place: str, timeout=10) -> Optional[Tuple[float, float]]:
+    if GEOPY_AVAILABLE:
         try:
-            c1, c2, c3 = left_col.columns([1,1,2])
+            loc = Nominatim(user_agent="erddap_integration_geocoder").geocode(place, timeout=timeout)
+            if loc: return float(loc.latitude), float(loc.longitude)
+        except Exception:
+            pass
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search", params={"q": place, "format":"json", "limit":1}, headers={"User-Agent":"erddap_integration/1.0"}, timeout=timeout)
+        j = r.json()
+        if isinstance(j, list) and j:
+            return float(j[0]["lat"]), float(j[0]["lon"])
+    except Exception:
+        pass
+    return None
 
-            with c1:
-                st.markdown(f"<div class='stat'><strong>{len(df_prev)}</strong><div class='small muted'>records</div></div>", unsafe_allow_html=True)
-            with c2:
-                unique_locs = df_prev.dropna(subset=['decimalLongitude','decimalLatitude']).shape[0]
-                st.markdown(f"<div class='stat'><strong>{unique_locs}</strong><div class='small muted'>geo points</div></div>", unsafe_allow_html=True)
-            with c3:
-                range_time = "-"
-                if "eventDate" in df_prev.columns:
-                    try:
-                        if df_prev["eventDate"].notna().any():
-                            mn = df_prev["eventDate"].min(); mx = df_prev["eventDate"].max()
-                            if hasattr(mn, "date"):
-                                range_time = f"{mn.date()} → {mx.date()}"
-                            else:
-                                range_time = f"{mn} → {mx}"
-                    except Exception:
-                        pass
-                st.markdown(f"<div class='small muted'>Date range: {range_time}</div>", unsafe_allow_html=True)
+def erddap_search(server: str, query: str, items_per_page: int = 200) -> pd.DataFrame:
+    try:
+        url = f"{server.rstrip('/')}/search/index.csv?searchFor={requests.utils.quote(query)}&itemsPerPage={items_per_page}"
+        r = requests.get(url, timeout=30); r.raise_for_status()
+        return pd.read_csv(io.StringIO(r.text))
+    except Exception:
+        return pd.DataFrame()
 
-            if "decimalLongitude" in df_prev.columns and "decimalLatitude" in df_prev.columns:
-                map_df = df_prev.dropna(subset=["decimalLongitude","decimalLatitude"])
-                if len(map_df) > 500:
-                    map_df = map_df.sample(500, random_state=1)
-                fig = px.scatter_geo(
-                map_df,
-                lon="decimalLongitude",
-                lat="decimalLatitude",
-                hover_name="scientificName",
-                hover_data=["eventDate","depth"] if "eventDate" in df_prev.columns else None,
-                projection="natural earth",
-                height=420,
-            )
-            # keep ocean color but enforce light styling so markers/axes are visible
+def get_dataset_info(server: str, dataset_id: str) -> Optional[dict]:
+    try:
+        url = f"{server.rstrip('/')}/info/{requests.utils.quote(dataset_id)}/index.json"
+        r = requests.get(url, timeout=20); r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+def _extract_variable_names_from_info(info_json) -> List[str]:
+    if not info_json: return []
+    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,40}", str(info_json)))
+    exclude = {'table','attributes','variable','dataset','dimension','id','units','title','name'}
+    return [t for t in tokens if t.lower() not in exclude and len(t) < 60][:200]
+
+def validate_dataset_for_keywords(server, dataset_id, keywords, accept_if_candidates=True):
+    info = get_dataset_info(server, dataset_id)
+    if not info: return {"valid": False, "variables": [], "info": None}
+    txt = str(info).lower()
+    found = [k for k in keywords if k.lower() in txt]
+    cand = _extract_variable_names_from_info(info)
+    valid = bool(found or (accept_if_candidates and cand))
+    return {"valid": valid, "variables": found + cand, "info": info}
+
+def discover_dataset(server, friendly_var, search_phrases, var_keywords, curated_fallback=None):
+    q = " ".join(search_phrases)
+    df = erddap_search(server, q)
+    candidates = []
+    if not df.empty:
+        cols = [c.lower() for c in df.columns]
+        for cnd in ["dataset id","dataset","Dataset ID","Dataset"]:
+            if cnd.lower() in cols:
+                ds_col = df.columns[cols.index(cnd.lower())]
+                candidates = list(df[ds_col].dropna().unique()); break
+    if curated_fallback:
+        for c in curated_fallback:
+            if c not in candidates: candidates.append(c)
+    for ds in candidates:
+        val = validate_dataset_for_keywords(server, ds, var_keywords, accept_if_candidates=True)
+        if val["valid"]:
+            var = val["variables"][0] if val["variables"] else None
+            return ds, var, f"Discovered {ds}; var: {var}"
+    return None, None, "No validated dataset found."
+
+def _try_griddap_point(server, dataset_id, variable, start_iso, end_iso, lat, lon, depth=None, timeout=60):
+    from pandas.errors import ParserError
+    debug = []
+    orders_with_depth = [
+        ("time","depth","latitude","longitude"),
+        ("time","latitude","longitude","depth"),
+        ("time","latitude","depth","longitude"),
+        ("time","longitude","latitude","depth"),
+        ("time","depth","longitude","latitude"),
+    ]
+    orders_no_depth = [("time","latitude","longitude"), ("time","longitude","latitude")]
+
+    def idx_for(order):
+        parts=[]
+        for dim in order:
+            if dim=="time": parts.append(f"[({start_iso}):1:({end_iso})]")
+            elif dim=="latitude": parts.append(f"[({lat}):1:({lat})]")
+            elif dim=="longitude": parts.append(f"[({lon}):1:({lon})]")
+            elif dim=="depth":
+                if depth is None or depth=="ALL": return None
+                parts.append(f"[({depth}):1:({depth})]")
+        return "".join(parts)
+
+    var_q = requests.utils.quote(variable) if variable else ""
+    def build_url(dataset_id, var_q, idx):
+        ds_q = requests.utils.quote(dataset_id)
+        idx_q = requests.utils.quote(idx, safe="[]():,")
+        if var_q: return f"{server.rstrip('/')}/griddap/{ds_q}.csv?{var_q}{idx_q}"
+        return f"{server.rstrip('/')}/griddap/{ds_q}.csv?{idx_q}"
+
+    seq = orders_with_depth if (depth is not None and depth!="ALL") else orders_no_depth
+    for order in seq:
+        idx = idx_for(order)
+        if not idx: continue
+        url = build_url(dataset_id, var_q, idx)
+        try:
+            r = requests.get(url, timeout=timeout)
+            snippet = r.text[:800] + "..." if isinstance(r.text, str) and len(r.text) > 800 else r.text
+            debug.append((getattr(r, "url", url), snippet))
+            if r.status_code != 200: continue
+            try:
+                df = pd.read_csv(io.StringIO(r.text))
+            except ParserError as pe:
+                debug.append((url, f"PARSER_ERROR:{pe}")); continue
+            cols_lower = {c.lower(): c for c in df.columns}
+            ren = {}
+            for k in ['time','latitude','longitude','depth','z','altitude','depthBelowSeaSurface']:
+                if k in cols_lower:
+                    ren[cols_lower[k]] = 'depth' if k in ['depth','z','depthBelowSeaSurface'] else k
+            if ren: df.rename(columns=ren, inplace=True)
+            if 'time' in df.columns:
+                df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
+                df = df.dropna(subset=['time'])
+            return df, debug
+        except Exception as e:
+            debug.append((url, f"EXC:{e}"))
+    return pd.DataFrame(), debug
+
+def _try_tabledap(server, dataset_id, variable, start_iso, end_iso, lat, lon, timeout=60):
+    from pandas.errors import ParserError
+    debug = []
+    var_part = variable if variable else ""
+    base = f"{server.rstrip('/')}/tabledap/{requests.utils.quote(dataset_id)}.csv"
+    url = f"{base}?{requests.utils.quote(var_part)}" if var_part else base
+    params = { "time>=": start_iso, "time<=": end_iso, "latitude": lat, "longitude": lon }
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        snippet = r.text[:800] + "..." if isinstance(r.text, str) and len(r.text) > 800 else r.text
+        debug.append((getattr(r, "url", url), snippet))
+        if r.status_code != 200: return pd.DataFrame(), debug
+        try:
+            df = pd.read_csv(io.StringIO(r.text))
+        except ParserError as pe:
+            debug.append((url, f"PARSER_ERROR:{pe}")); return pd.DataFrame(), debug
+        cols_lower = {c.lower(): c for c in df.columns}
+        ren = {}
+        for k in ['time','latitude','longitude','depth','z','altitude','depthBelowSeaSurface']:
+            if k in cols_lower:
+                ren[cols_lower[k]] = 'depth' if k in ['depth','z','depthBelowSeaSurface'] else k
+        if ren: df.rename(columns=ren, inplace=True)
+        if 'time' in df.columns:
+            df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
+            df = df.dropna(subset=['time'])
+        return df, debug
+    except Exception as e:
+        debug.append((url, f"EXC:{e}"))
+        return pd.DataFrame(), debug
+
+def fetch_with_3d_support(server, dataset_id, variable, lat, lon, start_dt, end_dt, timeout=60):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NRT_CUTOFF_DAYS)
+    periods = []
+    if end_dt < cutoff: periods.append((start_dt, end_dt))
+    elif start_dt >= cutoff: periods.append((start_dt, end_dt))
+    else:
+        periods.append((start_dt, cutoff - timedelta(seconds=1)))
+        periods.append((cutoff, end_dt))
+    all_dfs, debug = [], []
+    for sdt, edt in periods:
+        s_iso, e_iso = _format_iso(sdt), _format_iso(edt)
+        df_g, dbg_g = _try_griddap_point(server, dataset_id, variable, s_iso, e_iso, lat, lon, depth=None, timeout=timeout)
+        debug.extend(dbg_g)
+        if not df_g.empty: all_dfs.append(df_g); continue
+        df_t, dbg_t = _try_tabledap(server, dataset_id, variable, s_iso, e_iso, lat, lon, timeout=timeout)
+        debug.extend(dbg_t)
+        if not df_t.empty: all_dfs.append(df_t); continue
+        df_g0, dbg_g0 = _try_griddap_point(server, dataset_id, variable, s_iso, e_iso, lat, lon, depth=0, timeout=timeout)
+        debug.extend(dbg_g0)
+        if not df_g0.empty: all_dfs.append(df_g0); continue
+    if not all_dfs: return pd.DataFrame(), debug
+    df_all = pd.concat(all_dfs, ignore_index=True, sort=False)
+    if 'time' in df_all.columns: df_all = df_all.sort_values('time').reset_index(drop=True)
+    return df_all, debug
+
+def plot_timeseries(df, varcol, title=None):
+    if df.empty or varcol not in df.columns or 'time' not in df.columns:
+        return go.Figure().update_layout(title="No timeseries available")
+    fig = px.line(df, x='time', y=varcol, title=title or f"Timeseries: {varcol}")
+    fig.update_xaxes(rangeslider_visible=True)
+    _style_plotly_light(fig); return fig
+
+def plot_profile_heatmap(df, varcol, title=None):
+    if df.empty or varcol not in df.columns or 'time' not in df.columns or 'depth' not in df.columns:
+        return go.Figure().update_layout(title="No profile/heatmap available")
+    pivot = df.pivot_table(index='depth', columns='time', values=varcol, aggfunc='mean')
+    pivot = pivot.sort_index(ascending=True)
+    fig = go.Figure(data=go.Heatmap(x=[str(t) for t in pivot.columns], y=list(pivot.index), z=pivot.values, colorbar=dict(title=varcol)))
+    fig.update_layout(title=title or f"Depth-Time heatmap ({varcol})", yaxis=dict(autorange='reversed'))
+    _style_plotly_light(fig); return fig
+
+def plot_profile_scatter(df, varcol, title=None):
+    if df.empty or varcol not in df.columns or 'depth' not in df.columns:
+        return go.Figure().update_layout(title="No profile available")
+    prof = df.groupby('depth')[varcol].mean().reset_index().sort_values('depth')
+    fig = px.line(prof, x=varcol, y='depth', title=title or f"Vertical profile ({varcol})", markers=True)
+    fig.update_yaxes(autorange='reversed'); _style_plotly_light(fig); return fig
+
+def plot_map_latest(df, varcol, title=None):
+    if df.empty or 'latitude' not in df.columns or 'longitude' not in df.columns:
+        return go.Figure().update_layout(title="No spatial data")
+    latest = df.loc[[df['time'].idxmax()]] if 'time' in df.columns else df.head(1)
+    fig = px.scatter_geo(latest, lat='latitude', lon='longitude', hover_name=varcol if varcol in latest.columns else None,
+                         hover_data=[c for c in ['time', varcol] if c in latest.columns], title=title or "Latest location")
+    _style_plotly_light(fig); return fig
+
+def render_html_report(output_filename, figures, df_table, caption="ERDDAP Results"):
+    frags = [pio.to_html(fig, include_plotlyjs=False, full_html=False) for fig in figures]
+    try:
+        df_disp = df_table.copy()
+        for c in df_disp.select_dtypes(include=["float64", "int64"]).columns:
+            df_disp[c] = df_disp[c].round(4)
+        html_table = df_disp.to_html(index=False)
+    except Exception:
+        html_table = df_table.to_html(index=False)
+    html_doc = f"""<!doctype html><html><head><meta charset="utf-8"/>
+<title>ERDDAP Report</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>body{{margin:20px;background:#f8f9fa;font-family:Segoe UI, Roboto, Arial}}</style></head><body>
+<div class="container"><h2>{html.escape(caption)}</h2>"""
+    for frag in frags:
+        html_doc += f'<div class="card"><div class="card-body">{frag}</div></div>\n'
+    html_doc += f'<div class="card"><div class="card-body"><h5>Data table</h5>{html_table}</div></div>\n'
+    html_doc += '<hr/><p>Generated by app.py</p></div></body></html>'
+    with open(output_filename, "w", encoding="utf-8") as f:
+        f.write(html_doc)
+    return output_filename
+
+def erddap_streamlit_widget(server_default=ERDDAP_SERVER_DEFAULT):
+    st.sidebar.header("ERDDAP 3D Query")
+    var_choice = st.sidebar.selectbox("Variable", ["Temperature", "Salinity", "Chlorophyll"])
+    place = st.sidebar.text_input("Place (e.g., 'Chennai, India')")
+    manual_latlon = st.sidebar.text_input("Or lat,lon (e.g., '13.0827,80.2707')")
+    month_year = st.sidebar.text_input("Month-Year (MM-YYYY) optional")
+    server_input = st.sidebar.text_input("ERDDAP server", value=server_default)
+
+    if st.sidebar.button("Fetch ERDDAP"):
+        latlon = None
+        if manual_latlon:
+            try:
+                p = [x.strip() for x in manual_latlon.split(',')]
+                latlon = (float(p[0]), float(p[1]))
+            except Exception:
+                st.sidebar.error("Invalid lat,lon"); return
+        elif place:
+            with st.sidebar:
+                with st.spinner("Geocoding..."):
+                    latlon = geocode_place(place)
+            if not latlon:
+                st.sidebar.error("Geocoding failed"); return
+        else:
+            st.sidebar.warning("Provide a place or lat,lon"); return
+
+        lat, lon = latlon
+        if month_year:
+            try:
+                m, y = map(int, month_year.split('-'))
+                _, last_day = calendar.monthrange(y, m)
+                start_dt = datetime(y, m, 1, tzinfo=timezone.utc)
+                end_dt = datetime(y, m, last_day, 23, 59, 59, tzinfo=timezone.utc)
+            except Exception:
+                st.sidebar.error("Invalid Month-Year format"); return
+        else:
+            end_dt = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(days=30)
+        st.info(f"ERDDAP: {var_choice} @ ({lat:.3f},{lon:.3f}) from {_format_iso(start_dt)} to {_format_iso(end_dt)}")
+
+        heuristics = {
+            "Temperature": (["sea surface temperature","sst"], ["analysed_sst","sea_surface_temperature","sst","temperature","sstAnom","sst_anom"]),
+            "Salinity": (["salinity","sss"], ["salinity","sea_surface_salinity","sss"]),
+            "Chlorophyll": (["chlorophyll","chl"], ["chlor_a","chl","CHL_Weekly","chlorophyll"]),
+        }
+        search_terms, var_keywords = heuristics[var_choice]
+        server_key = server_input.rstrip('/')
+        curated = []
+        if server_key in CURATED_DATASETS: curated += CURATED_DATASETS[server_key]
+        curated += [d for d in CURATED_DATASETS.get("global", []) if d not in curated]
+
+        with st.spinner("Searching dataset..."):
+            ds_id, var_guess, note = discover_dataset(server_input, var_choice, search_terms, var_keywords, curated_fallback=curated)
+        if ds_id and not var_guess:
+            vars_candidates = _extract_variable_names_from_info(get_dataset_info(server_input, ds_id))
+            if vars_candidates: var_guess = vars_candidates[0]
+        if not ds_id:
+            st.error("No dataset found: " + note); return
+
+        with st.spinner("Fetching data..."):
+            df, debug = fetch_with_3d_support(server_input, ds_id, var_guess, lat, lon, start_dt, end_dt)
+        if df.empty:
+            st.error("No data returned. Showing debug attempts:")
+            st.write(debug[:8]); return
+
+        data_cols = [c for c in df.columns if c.lower() not in ['time','latitude','longitude','depth']]
+        varcol = data_cols[0] if data_cols else None
+        st.plotly_chart(plot_timeseries(df, varcol), use_container_width=True)
+        if 'depth' in df.columns:
+            st.plotly_chart(plot_profile_heatmap(df, varcol), use_container_width=True)
+            st.plotly_chart(plot_profile_scatter(df, varcol), use_container_width=True)
+        st.plotly_chart(plot_map_latest(df, varcol), use_container_width=True)
+        st.markdown("**ERDDAP data (sample):**")
+        st.dataframe(df.head(50))
+
+# ----------- SYNTHETIC NETCDF -----------
+def generate_ocean_netcdf(outfile_path,
+                          lon_min=68.0, lon_max=96.0,
+                          lat_min=6.0, lat_max=24.0,
+                          nx=40, ny=40, nt=12,
+                          start_date=None, depths=None, variables=None):
+    if start_date is None:
+        start_date = pd.to_datetime(date.today()).normalize()
+    if depths is None:
+        depths = np.array([0,10,20,50,100,200], dtype=float)
+    if variables is None:
+        variables = ["temperature", "salinity"]
+
+    lons = np.linspace(lon_min, lon_max, nx)
+    lats = np.linspace(lat_min, lat_max, ny)
+    times = pd.date_range(start=start_date, periods=nt, freq="MS")
+
+    shape = (len(times), len(depths), len(lats), len(lons))
+    base_temp = 15.0
+    temp = np.zeros(shape, dtype=np.float32)
+    salt = np.zeros(shape, dtype=np.float32)
+    lon_grad = (lons[np.newaxis, :] - lon_min) / max(1e-9, (lon_max - lon_min))
+    lat_grad = (lats[:, np.newaxis] - lat_min) / max(1e-9, (lat_max - lat_min))
+    grid = (lat_grad[:,:,None] * lon_grad[None,None,:]).astype(np.float32)
+    for ti in range(len(times)):
+        seasonal = 2.0 * np.sin(2*np.pi*(ti/max(1, nt)))
+        for di, d in enumerate(depths):
+            depth_decay = np.exp(-d / 50.0)
+            temp[ti, di] = base_temp + seasonal + 8.0*depth_decay + 0.5*grid
+            salt[ti, di] = 35.0 + 0.01 * d + 0.2 * grid
+
+    data_vars = {}
+    if "temperature" in variables: data_vars["temperature"] = (("time","depth","lat","lon"), temp)
+    if "salinity" in variables: data_vars["salinity"] = (("time","depth","lat","lon"), salt)
+    ds = xr.Dataset(data_vars=data_vars, coords={"time": times, "depth": depths, "lat": lats, "lon": lons})
+    ds.attrs["title"] = "FloatChat generated ocean dataset"
+    ds.attrs["created_by"] = "FloatChat"
+    ds.to_netcdf(outfile_path)
+    return ds
+
+def plot_variable_map_from_ds(ds, var="temperature", time_index=0, depth_index=0):
+    if var not in ds: return None
+    da = ds[var].isel(time=time_index, depth=depth_index)
+    df = da.to_dataframe(name=var).reset_index()
+    fig = px.scatter(df, x="lon", y="lat", color=var, size_max=6,
+                     title=f"{var} (time={str(ds.time.values[time_index])}, depth={float(ds.depth.values[depth_index])} m)")
+    _style_plotly_light(fig); return fig
+
+def plot_variable_profile_at_point(ds, var="temperature", lon_val=None, lat_val=None, time_index=0):
+    if var not in ds: return None
+    if lon_val is None: lon_val = float(ds.lon.mean())
+    if lat_val is None: lat_val = float(ds.lat.mean())
+    lon_idx = int(np.abs(ds.lon.values - lon_val).argmin())
+    lat_idx = int(np.abs(ds.lat.values - lat_val).argmin())
+    da = ds[var].isel(time=time_index, lat=lat_idx, lon=lon_idx)
+    prof = pd.DataFrame({"depth": ds.depth.values, var: da.values})
+    fig = px.line(prof, x=var, y="depth", title=f"{var} profile at lon={lon_val:.2f}, lat={lat_val:.2f}")
+    fig.update_yaxes(autorange="reversed"); _style_plotly_light(fig); return fig
+
+def plot_variable_timeseries_at_point(ds, var="temperature", lon_val=None, lat_val=None, depth_index=0):
+    if var not in ds: return None
+    if lon_val is None: lon_val = float(ds.lon.mean())
+    if lat_val is None: lat_val = float(ds.lat.mean())
+    lon_idx = int(np.abs(ds.lon.values - lon_val).argmin())
+    lat_idx = int(np.abs(ds.lat.values - lat_val).argmin())
+    da = ds[var].isel(depth=depth_index, lat=lat_idx, lon=lon_idx)
+    ts = pd.DataFrame({"time": ds.time.values, var: da.values})
+    fig = px.line(ts, x="time", y=var, title=f"{var} timeseries at lon={lon_val:.2f}, lat={lat_val:.2f}, depth={float(ds.depth.values[depth_index])} m")
+    _style_plotly_light(fig); return fig
+
+# ----------- UI HEADER -----------
+st.title("FloatChat: AI-Powered ARGO & OBIS Ocean Data Explorer")
+st.markdown(
+    "<div class='muted'>Type a <b>common name</b> (e.g., <i>Indian oil sardine</i>) or a <b>scientific name</b> (e.g., <i>Sardinella longiceps</i>). We’ll auto-route and search.</div>",
+    unsafe_allow_html=True,
+)
+
+# ----------- SIDEBAR -----------
+with st.sidebar:
+    st.markdown("## Controls")
+    theme = st.selectbox("Theme", list(THEMES.keys()), index=list(THEMES.keys()).index(st.session_state["theme"]))
+    if theme != st.session_state["theme"]:
+        st.session_state["theme"] = theme
+        st.markdown(f"<style>{THEMES[theme]}</style>", unsafe_allow_html=True)
+
+    max_records = st.slider("Max OBIS records", 10, 3000, 500, step=10)
+    bbox_enable = st.checkbox("Filter by bounding box", value=False)
+    if bbox_enable:
+        lon_min = st.number_input("Lon min", value=68.0, step=0.1, format="%.3f")
+        lon_max = st.number_input("Lon max", value=96.0, step=0.1, format="%.3f")
+        lat_min = st.number_input("Lat min", value=6.0, step=0.1, format="%.3f")
+        lat_max = st.number_input("Lat max", value=24.0, step=0.1, format="%.3f")
+
+    st.markdown("---")
+    st.markdown("## Date range")
+    start_date = st.date_input("Start", value=date(2000, 1, 1))
+    end_date = st.date_input("End", value=date.today())
+    if start_date and end_date and start_date > end_date:
+        st.warning("Start date is after end date.")
+
+    st.markdown("---")
+    st.markdown("## NetCDF (synthetic)")
+    gen_enable = st.checkbox("Enable generator", value=False)
+    if gen_enable:
+        nc_nx = st.number_input("Longitude points (nx)", 8, 400, 40, step=8)
+        nc_ny = st.number_input("Latitude points (ny)", 8, 400, 40, step=8)
+        nc_nt = st.number_input("Time steps (nt)", 1, 48, 12)
+        nc_depths_str = st.text_input("Depths (m, comma)", value="0,10,20,50,100,200")
+        nc_vars = st.multiselect("Variables", ["temperature","salinity","oxygen","nitrate"], default=["temperature","salinity"])
+
+    st.markdown("---")
+    st.markdown("## AI")
+    st.caption(f"Model: {OPENROUTER_MODEL}")
+    auto_summary = st.checkbox("Auto-summarize after fetch", value=True)
+
+    st.markdown("---")
+    erddap_streamlit_widget()
+
+# ----------- INPUT BAR -----------
+with st.form(key="single_input_form", clear_on_submit=False):
+    query = st.text_input("Enter common or scientific name, or ask a question", value="", key="single_input")
+    submitted = st.form_submit_button("Submit")
+
+# ----------- SAVED SEARCHES / BOOKMARKS -----------
+st.session_state.setdefault("search_history", [])
+st.session_state.setdefault("bookmarks", [])
+
+def add_to_history(display, scientific, provenance):
+    st.session_state["search_history"].append({
+        "t": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "q": display, "sci": scientific, "prov": provenance
+    })
+    if len(st.session_state["search_history"]) > 20:
+        st.session_state["search_history"] = st.session_state["search_history"][-20:]
+
+def bookmark_current(species):
+    if species and species not in st.session_state["bookmarks"]:
+        st.session_state["bookmarks"].append(species)
+
+# ----------- LAYOUT COLUMNS -----------
+try:
+    left, right = st.columns([2.4, 1.0], gap="large")
+except TypeError:
+    left, right = st.columns([2.4, 1.0])
+
+# ----------- PREVIOUS DATA (persistent) -----------
+with left:
+    df_prev = load_df("obis")
+    if df_prev is not None and not df_prev.empty:
+        st.markdown("### Previously fetched OBIS records (cached)")
+        c1, c2, c3 = st.columns([1,1,2])
+        with c1: st.markdown(f"<div class='stat'><b>{len(df_prev)}</b><div class='small muted'>records</div></div>", unsafe_allow_html=True)
+        with c2:
+            unique_locs = df_prev.dropna(subset=['decimalLongitude','decimalLatitude']).shape[0]
+            st.markdown(f"<div class='stat'><b>{unique_locs}</b><div class='small muted'>geo points</div></div>", unsafe_allow_html=True)
+        with c3:
+            rng = "-"
+            if "eventDate" in df_prev.columns and df_prev["eventDate"].notna().any():
+                mn, mx = df_prev["eventDate"].min(), df_prev["eventDate"].max()
+                rng = f"{mn.date()} → {mx.date()}"
+            st.markdown(f"<div class='small muted'>Date range: {rng}</div>", unsafe_allow_html=True)
+
+        if {"decimalLongitude","decimalLatitude"}.issubset(df_prev.columns):
+            map_df = df_prev.dropna(subset=["decimalLongitude","decimalLatitude"])
+            if len(map_df) > 700: map_df = map_df.sample(700, random_state=1)
+            fig = px.scatter_geo(map_df, lon="decimalLongitude", lat="decimalLatitude",
+                                 hover_name="scientificName" if "scientificName" in map_df.columns else None,
+                                 hover_data=["eventDate","depth"] if "eventDate" in df_prev.columns else None,
+                                 projection="natural earth", height=430, title="Cached occurrences")
             fig.update_layout(geo=dict(showcountries=True, oceancolor="rgb(3,29,44)"))
             _style_plotly_light(fig)
             st.plotly_chart(fig, use_container_width=True)
 
+        st.markdown("#### Sample cached records")
+        st.dataframe(df_prev.head(200))
 
-            st.markdown("#### Sample cached records")
-            st.dataframe(df_prev.head(200))
+        # Downloads
+        try:
+            dl_button(st, "Download cached CSV", prepare_csv_download(df_prev), "obis_records.csv", "text/csv", base="cached_csv")
+            xlsx = prepare_excel_download(df_prev)
+            dl_button(st, "Download cached Excel", xlsx, "obis_records.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", base="cached_xlsx")
+        except Exception:
+            dl_button(st, "Download cached CSV", prepare_csv_download(df_prev), "obis_records.csv", "text/csv", base="cached_csv_fallback")
+            st.info("Install openpyxl for Excel export.")
 
-            # show last AI summary if available (persisted)
-            if st.session_state.get("last_summary"):
-                st.markdown("#### Last AI summary (cached)")
-                st.write(st.session_state.get("last_summary"))
+        if st.button("Clear cached data"):
+            for k in ["obis_records","obis_columns","last_species","last_summary","last_pdf","last_pdf_name","last_pdf_species","data_ai_history"]:
+                st.session_state.pop(k, None)
+            safe_rerun()
 
-            # download CSV & Excel
-
-            try:
-                df_for_dl = load_obis_df()
-                if df_for_dl is not None:
-                    csv_buf = StringIO()
-                    df_for_dl.to_csv(csv_buf, index=False)
-                    dl_button(left_col, "Download cached records (CSV)", data=csv_buf.getvalue(), file_name="obis_records.csv", mime="text/csv", base="cached_obis")
-                    try:
-                        buf = BytesIO()
-                        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                            df_for_dl.to_excel(writer, index=False, sheet_name="records")
-                        dl_button(left_col, "Download cached records (Excel)", data=buf.getvalue(), file_name="obis_records.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", base="cached_obis_xlsx")
-                    except Exception:
-                        # Excel optional; CSV always available
-                        pass
-                else:
-                    st.info("No cached dataset available for download.")
-                
-                
-
-
-            except Exception:
-                # If openpyxl (or excel writer) not installed, still allow CSV
-                csv_str = prepare_csv_download(df_prev)
-                dl_button(left_col, "Download cached records (CSV)", data=csv_str,
-                          file_name="obis_records.csv", mime="text/csv", base="cached_obis_fallback")
-
-                st.info("Install openpyxl to enable Excel download: pip install openpyxl")
-
-
-                        # clear cache (button inside left column)
-            if left_col.button("Clear cached data"):
-                # remove serialized dataset and other cached UI artifacts
-                st.session_state.pop("obis_df_records", None)
-                st.session_state.pop("obis_df_columns", None)
-                st.session_state.pop("last_species", None)
-                st.session_state.pop("last_summary", None)
-                # Correct keys used elsewhere in the app:
-                st.session_state.pop("last_pdf", None)
-                st.session_state.pop("last_pdf_name", None)
-                st.session_state.pop("last_pdf_species", None)
-                st.session_state.pop("data_ai_history", None)
-                safe_rerun()
-
-
-
-        except Exception as e:
-            st.warning("Could not render cached data preview: " + str(e))
-
-# Persistent dataset-AI UI (renders whenever cached dataset exists)
-df_prev = load_obis_df()
+# ----------- RIGHT PANEL: AI/Q&A & EXPORT -----------
 if df_prev is not None and not df_prev.empty:
-    # Render persistent AI controls in right_col (so they remain after downloads/reruns)
-    with right_col:
-        st.markdown("###  Ask AI about cached dataset")
-        # text area bound to session key so value survives reruns
-        ai_data_query = st.text_area(
-            "Ask a question about the cached dataset (AI will see a small sample and previous summary):",
-            key="data_ai_input",
-            height=120
-        )
-
-        if st.button("Ask AI about cached data", key="ask_cached_data_ai"):
-            # stable read of query
-            ai_data_query = st.session_state.get("data_ai_input", "").strip()
-            st.session_state["last_data_ai_query"] = ai_data_query
-
-            # prepare compact sample
-            sample_for_ai = None
-            try:
-                df_for_sample = load_obis_df()
-                if df_for_sample is not None and not df_for_sample.empty:
-                    sample_for_ai = df_for_sample.head(30).to_dict(orient="records")
-            except Exception:
-                sample_for_ai = None
-
-            # build messages
-            system_msg = {
-                "role": "system",
-                "content": "You are a helpful marine biology data assistant. Analyze the sample and answer the user's question concisely, suggest one next-step analysis."
-            }
-            parts = []
-            if sample_for_ai:
-                parts.append(f"Sample records (up to 30 rows): {sample_for_ai}")
+    with right:
+        st.markdown("### Ask AI about cached dataset")
+        ai_q = st.text_area("Your question", key="data_ai_input", height=120)
+        if st.button("Ask AI about cached data", key="ask_cached_ai"):
+            sample = df_prev.head(30).to_dict(orient="records")
+            parts = [f"Sample (<=30 rows): {sample}"]
             if st.session_state.get("last_summary"):
-                parts.append(f"Existing AI summary: {st.session_state.get('last_summary')}")
-            parts.append(f"User question: {ai_data_query or '[NO QUESTION]'}")
-            user_msg = {"role": "user", "content": "\n\n".join(parts)}
+                parts.append(f"Existing AI summary: {st.session_state['last_summary']}")
+            parts.append(f"Question: {ai_q or '[NO QUESTION]'}")
+            with st.spinner("AI analyzing..."):
+                ans = ask_openrouter([{"role":"system","content":"You are a helpful marine data assistant. Be concise."},
+                                      {"role":"user","content":"\n\n".join(parts)}])
+            st.session_state.setdefault("data_ai_history", []).append({"q": ai_q, "a": ans, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")})
+            st.session_state["last_summary"] = st.session_state.get("last_summary") or ans
+            st.markdown("**AI answer:**"); st.markdown(ans)
 
-            # show loading pulse
-            loading_slot = right_col.empty()
-            loading_slot.markdown("<div class='muted'><span class='pulse'></span> AI analyzing dataset...</div>", unsafe_allow_html=True)
-            try:
-                ai_reply = ask_openrouter([system_msg, user_msg])
-                entry = {"question": ai_data_query, "answer": ai_reply, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
-                st.session_state.setdefault("data_ai_history", []).append(entry)
-                st.session_state["last_data_ai_reply"] = ai_reply
-                # optionally keep this as last_summary as well
-                st.session_state["last_summary"] = st.session_state.get("last_summary") or ai_reply
-                right_col.markdown("**AI answer:**")
-                right_col.markdown(ai_reply)
-            except Exception as e:
-                right_col.error(f"AI request failed: {e}")
-            finally:
-                loading_slot.empty()
-
-        # show recent dataset-AI Q&A (most recent first)
         if st.session_state.get("data_ai_history"):
             st.markdown("#### Recent dataset queries")
             for item in reversed(st.session_state["data_ai_history"][-6:]):
-                with st.expander(f"Q: {item['question'][:60] or '(no question)'} — {item['time']}", expanded=False):
-                    st.markdown(f"**Q:** {item['question']}")
-                    st.markdown(f"**A:** {item['answer']}")
+                with st.expander(f"Q: {item['q'][:60] if item['q'] else '(no question)'} — {item['time']}"):
+                    st.markdown(f"**Q:** {item['q']}\n\n**A:** {item['a']}")
 
-# Process the single submit
-
-
-
-
-if submit and user_input.strip():
-    with st.spinner("Routing your input via the LLM..."):
-        decision = interpret_input_via_ai(user_input)
-
-    if decision.get("action") == "search" and decision.get("species"):
-        chosen_species = decision["species"]
-        left_col.markdown(f"###  Searching OBIS for species: **{chosen_species}**")
-        loader = left_col.empty()
-        loader.markdown("<div class='muted'><span class='pulse'></span> Fetching records…</div>", unsafe_allow_html=True)
-        try:
-            bbox = None
-            if bbox_enable:
-                bbox = {"lonmin": lon_min, "lonmax": lon_max, "latmin": lat_min, "latmax": lat_max}
-
-            df = fetch_obis_records(chosen_species, size=max_records, bbox=bbox)
-
-            # parse and filter by date range (if eventDate is present)
-            if not df.empty and "eventDate" in df.columns:
-                try:
-                    df["eventDate"] = pd.to_datetime(df["eventDate"], errors="coerce")
-                    if start_date:
-                        df = df[df["eventDate"] >= pd.to_datetime(start_date)]
-                    if end_date:
-                        df = df[df["eventDate"] <= pd.to_datetime(end_date)]
-                except Exception:
-                    pass
-
-            loader.empty()
-            if df.empty:
-                left_col.warning(f"No records found for species: {chosen_species} (after date/filters)")
+        st.markdown("### Export")
+        if st.button("Generate PDF report"):
+            df_for_pdf = load_df("obis")
+            if df_for_pdf is None or df_for_pdf.empty:
+                st.error("No dataset to export.")
             else:
-                keep_cols = [c for c in ["scientificName","eventDate","decimalLongitude","decimalLatitude","depth","basisOfRecord","institutionCode"] if c in df.columns]
-                df_clean = df[keep_cols].copy()
-                if "eventDate" in df_clean.columns:
-                    try:
-                        df_clean["eventDate"] = pd.to_datetime(df_clean["eventDate"], errors="coerce")
-                    except Exception:
-                        pass
+                with st.spinner("Rendering PDF..."):
+                    figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species",""))
+                    pdf = generate_pdf_report(df_for_pdf, st.session_state.get("last_species",""), st.session_state.get("last_summary",""), figs_local)
+                fname = f"{(st.session_state.get('last_species') or 'obis_report').replace(' ','_')}_report.pdf"
+                st.session_state["last_pdf"] = pdf
+                st.session_state["last_pdf_name"] = fname
+                st.success(f"PDF ready — {len(pdf):,} bytes")
+                auto_ok = _auto_download_pdf_bytes(pdf, fname)
+                if not auto_ok:
+                    dl_button(st, "Download PDF report", pdf, fname, "application/pdf", base="pdf_manual")
 
-                # store in session for AI use and persistent display (store as plain records+cols)
-                save_obis_df(df_clean)
-                st.session_state["last_species"] = chosen_species  # save species for cached UI / downloads
-
-
-                left_col.success(f"Found {len(df_clean)} records for '{chosen_species}'")
-                # summary stats
-                c1, c2, c3 = left_col.columns([1,1,2])
-                with c1:
-                    left_col.markdown(f"<div class='stat'><strong>{len(df_clean)}</strong><div class='small muted'>records</div></div>", unsafe_allow_html=True)
-                with c2:
-                    unique_locs = df_clean.dropna(subset=["decimalLongitude","decimalLatitude"]).shape[0]
-                    left_col.markdown(f"<div class='stat'><strong>{unique_locs}</strong><div class='small muted'>geo points</div></div>", unsafe_allow_html=True)
-                with c3:
-                    range_time = "-"
-                    if "eventDate" in df_clean.columns and df_clean["eventDate"].notna().any():
-                        mn = df_clean["eventDate"].min(); mx = df_clean["eventDate"].max()
-                        range_time = f"{mn.date()} → {mx.date()}"
-                    left_col.markdown(f"<div class='small muted'>Date range: {range_time}</div>", unsafe_allow_html=True)
-
-                # map + plots
-                figs = make_plots_from_df(df_clean, chosen_species)
-                if "map" in figs:
-                    left_col.plotly_chart(figs["map"], use_container_width=True)
-                # show other figs in two rows
-                if "yearly" in figs or "monthly" in figs:
-                    row1 = left_col.columns(2)
-                    if "yearly" in figs:
-                        row1[0].plotly_chart(figs["yearly"], use_container_width=True)
-                    if "monthly" in figs:
-                        row1[1].plotly_chart(figs["monthly"], use_container_width=True)
-                if "depth_hist" in figs or "density" in figs:
-                    row2 = left_col.columns(2)
-                    if "depth_hist" in figs:
-                        row2[0].plotly_chart(figs["depth_hist"], use_container_width=True)
-                    if "density" in figs:
-                        row2[1].plotly_chart(figs["density"], use_container_width=True)
-
-                left_col.markdown("#### Sample records")
-                left_col.dataframe(df_clean.head(200))
-
-                # download CSV & Excel (for fetched results)
-                try:
-                    csv_str = prepare_csv_download(df_clean)
-                    xlsx_bytes = prepare_excel_download(df_clean)
-                    species_key = chosen_species.replace(" ", "_").replace("/", "_")
-                    dl_button(left_col, "Download fetched records (CSV)",
-                              data=csv_str, file_name=f"{species_key}_obis.csv", mime="text/csv", base=f"fetched_{species_key}")
-                    dl_button(left_col, "Download fetched records (Excel)",
-                              data=xlsx_bytes, file_name=f"{species_key}_obis.xlsx",
-                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", base=f"fetched_{species_key}")
-                except Exception:
-                    # fallback: CSV only
-                    csv_str = prepare_csv_download(df_clean)
-                    species_key = chosen_species.replace(" ", "_").replace("/", "_")
-                    dl_button(left_col, "Download fetched records (CSV)",
-                              data=csv_str, file_name=f"{species_key}_obis.csv", mime="text/csv", base=f"fetched_{species_key}_fallback")
-                    
-
-
-                # Auto-summary if enabled — keep summary in session so it persists across reruns
-                if auto_summary:
-                    right_col.markdown("###  AI Summary (auto)")
-                    loading_slot = right_col.empty()
-                    loading_slot.markdown("<div class='muted'><span class='pulse'></span> AI summarizing the fetched records...</div>", unsafe_allow_html=True)
-                    try:
-                        summary = ai_summarize_records(df_clean, chosen_species)
-                        # persist summary so it doesn't vanish on rerun
-                        st.session_state["last_summary"] = summary
-                        right_col.markdown(summary)
-                        # auto-generate PDF and trigger download (non-blocking for UI)
-                        try:
-                            # ensure df_for_pdf and figs_local are available similarly to your Generate PDF flow
-                            df_for_pdf = load_obis_df()
-                            if df_for_pdf is not None and not df_for_pdf.empty:
-                                figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species", chosen_species))
-                                pdf_bytes_auto = generate_pdf_report(df_for_pdf, st.session_state.get("last_species", chosen_species), summary, figs_local)
-                                if isinstance(pdf_bytes_auto, (bytes, bytearray)) and len(pdf_bytes_auto) > 0:
-                                    # store for later and auto-download
-                                    fname_auto = f"{(st.session_state.get('last_species') or chosen_species).replace(' ','_')}_auto_report.pdf"
-                                    st.session_state["last_pdf"] = pdf_bytes_auto
-                                    st.session_state["last_pdf_name"] = fname_auto
-                                    _auto_download_pdf_bytes(pdf_bytes_auto, fname_auto)
-                        except Exception as e:
-                            # don't break UI on auto-download failure — keep existing UI
-                            print("[WARN] auto PDF-on-summary failed:", e)
-
-                    except Exception as e:
-                        right_col.error(f"Auto-summary failed: {e}")
-                    finally:
-                        loading_slot.empty()
-
-
-                # --- DATASET-AWARE AI CHAT (persistent) ---
-                right_col.markdown("###  Ask AI about this dataset")
-                # Dataset-aware question input — use key only so Streamlit stores value in session_state reliably
-                ai_data_query = right_col.text_area(
-                    "Ask a question about the current dataset (the AI will see a small sample and previous summary):",
-                    key="data_ai_input",
-                    height=120
-                )
-
-                # When user clicks, send compact context + question to LLM and store the reply in session_state
-                if right_col.button("Ask AI about data", key="ask_data_ai"):
-                    # Read the latest user question from session (guaranteed to be stable across reruns)
-                    ai_data_query = st.session_state.get("data_ai_input", "").strip()
-                    st.session_state["last_data_ai_query"] = ai_data_query
-
-                    # prepare compact sample (safe size)
-                    sample_for_ai = None
-                    try:
-                        df_for_sample = load_obis_df()
-                        if df_for_sample is not None and not df_for_sample.empty:
-                            sample_for_ai = df_for_sample.head(30).to_dict(orient="records")
-
-                    except Exception:
-                        sample_for_ai = None
-
-                    # build messages
-                    system_msg = {
-                        "role": "system",
-                        "content": "You are a helpful marine biology data assistant. Analyze the sample and answer the user's question concisely, suggest one next-step analysis."
-                    }
-                    parts = []
-                    if sample_for_ai:
-                        parts.append(f"Sample records (up to 30 rows): {sample_for_ai}")
-                    if st.session_state.get("last_summary"):
-                        parts.append(f"Existing AI summary: {st.session_state.get('last_summary')}")
-                    parts.append(f"User question: {ai_data_query or '[NO QUESTION]'}")
-                    user_msg = {"role": "user", "content": "\n\n".join(parts)}
-
-                    # show a lightweight loading pulse in the right column while the LLM runs
-                    loading_slot = right_col.empty()
-                    loading_slot.markdown("<div class='muted'><span class='pulse'></span> AI analyzing dataset...</div>", unsafe_allow_html=True)
-                    try:
-                        ai_reply = ask_openrouter([system_msg, user_msg])
-                        # persist short history
-                        entry = {"question": ai_data_query, "answer": ai_reply, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
-                        st.session_state.setdefault("data_ai_history", []).append(entry)
-                        # store latest reply for UI uses and persist as "last_summary" so it doesn't vanish
-                        st.session_state["last_data_ai_reply"] = ai_reply
-                        st.session_state["last_summary"] = ai_reply
-                        # show answer
-                        right_col.markdown("**AI answer:**")
-                        right_col.markdown(ai_reply)
-                    except Exception as e:
-                        right_col.error(f"AI request failed: {e}")
-                    finally:
-                        loading_slot.empty()
-
-
-                # show recent dataset-AI Q&A (most recent first)
-                if st.session_state.get("data_ai_history"):
-                    right_col.markdown("#### Recent dataset queries")
-                    # show up to last 6 queries
-                    for item in reversed(st.session_state["data_ai_history"][-6:]):
-                        with right_col.expander(f"Q: {item['question'][:60] or '(no question)'} — {item['time']}", expanded=False):
-                            right_col.markdown(f"**Q:** {item['question']}")
-                            right_col.markdown(f"**A:** {item['answer']}")
-
-
-                # PDF report generation button
-                                # PDF report generation button
-                right_col.markdown("###  Export")
-                if right_col.button("Generate PDF report (maps + summary)"):
-                    right_col.info("Generating PDF... this may take a few seconds.")
-                    try:
-                        # Reconstruct dataset from session
-                        df_for_pdf = load_obis_df()
-                        if df_for_pdf is None or df_for_pdf.empty:
-                            right_col.error("No cached dataset available for PDF generation. Fetch a species first.")
-                        else:
-                            # prepare figures from the reconstructed df (do not rely on a local 'figs' variable that disappears after rerun)
-                            figs_local = make_plots_from_df(df_for_pdf, st.session_state.get("last_species", ""))
-                            summary_text = st.session_state.get("last_summary", "")
-                            pdf_loading = right_col.empty()
-                            pdf_loading.markdown("<div class='muted'><span class='pulse'></span> Rendering PDF...</div>", unsafe_allow_html=True)
-                            try:
-                                pdf_bytes = generate_pdf_report(df_for_pdf, st.session_state.get("last_species", ""), summary_text, figs_local)
-                                # force bytes
-                                if not isinstance(pdf_bytes, (bytes, bytearray)):
-                                    try:
-                                        pdf_bytes = pdf_bytes.getvalue()
-                                    except Exception as e:
-                                        raise RuntimeError(f"PDF generator returned non-bytes and could not be converted: {e}")
-
-                                # store PDF in session for persistent download
-                                fname = f"{(st.session_state.get('last_species') or 'obis_report').replace(' ','_')}_report.pdf"
-                                # store PDF into session
-                                st.session_state["last_pdf"] = pdf_bytes
-                                st.session_state["last_pdf_name"] = fname
-                                st.session_state["last_pdf_species"] = st.session_state.get("last_species")
-
-                                right_col.success("PDF generated — you can download it below.")
-                                right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
-
-                                # create a normal download button for fallback / manual download
-                                # Try auto-download first (JS). If it fails, show a manual download button as fallback.
-                                try:
-                                    auto_ok = _auto_download_pdf_bytes(pdf_bytes, fname)
-                                except Exception:
-                                    auto_ok = False
-
-                                right_col.success("PDF generated.")
-                                right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
-
-                                # If auto-download didn't work, provide the manual Streamlit download button as fallback
-                                if not auto_ok:
-                                    try:
-                                        dl_button(
-                                            right_col,
-                                            "Download PDF report",
-                                            data=pdf_bytes,
-                                            file_name=fname,
-                                            mime="application/pdf",
-                                            base=f"pdf_{fname}",
-                                        )
-                                    except Exception as e:
-                                        right_col.error(f"Could not create download button: {e}")
-                                else:
-                                    # user was auto-sent the file — optionally give a small note and avoid duplicate download buttons
-                                    right_col.markdown("<div class='small muted'>Auto-download attempted — check your browser downloads.</div>", unsafe_allow_html=True)
-
-
-                                # DO NOT clear the cached dataset here. Keep data for subsequent AI questions/downloads.
-                            except Exception as e:
-                                right_col.error(f"PDF creation failed: {e}")
-                                right_col.info("Common cause: missing kaleido or reportlab in the environment. Install them and restart Streamlit.")
-                            finally:
-                                pdf_loading.empty()
-                    except Exception as e:
-                        right_col.error(f"Failed to create PDF: {e}")
-
-
-                        # if AI summary not present, generate one (non-blocking)
-                        summary_text = ""
-                        if auto_summary:
-                            try:
-                                summary_text = ai_summarize_records(df_clean, chosen_species)
-                            except Exception as e:
-                                summary_text = ""
-                                right_col.warning(f"AI summary failed: {e}")
-                        else:
-                            summary_text = "No AI summary requested (toggle auto-summary in sidebar)."
-
-                                                # Attempt PDF creation and surface debug info
-                        # Reconstruct df from session (defensive)
-                        df_for_pdf = load_obis_df()
-                        if df_for_pdf is None:
-                            right_col.error("Dataset not available for PDF generation.")
-                        else:
-                            pdf_loading = right_col.empty()
-                            pdf_loading.markdown("<div class='muted'><span class='pulse'></span> Rendering PDF...</div>", unsafe_allow_html=True)
-                            try:
-                                figs_local = make_plots_from_df(df_for_pdf, chosen_species)
-                                pdf_bytes = generate_pdf_report(df_for_pdf, chosen_species, summary_text, figs_local)
-
-                                # coerce to bytes if necessary
-                                if not isinstance(pdf_bytes, (bytes, bytearray)):
-                                    try:
-                                        pdf_bytes = pdf_bytes.getvalue()
-                                    except Exception as e:
-                                        raise RuntimeError(f"PDF generator returned non-bytes and could not be converted: {e}")
-
-                                # store PDF in session for persistent download
-                                fname = f"{chosen_species.replace(' ','_')}_report.pdf"
-                                st.session_state["last_pdf"] = pdf_bytes
-                                st.session_state["last_pdf_name"] = fname
-                                st.session_state["last_pdf_species"] = chosen_species
-
-                                right_col.success("PDF generated — you can download it below.")
-                                right_col.markdown(f"**PDF size:** {len(pdf_bytes):,} bytes")
-
-                                # immediate download button in right column (unique key)
-                                try:
-                                    dl_button(right_col, "Download PDF report (immediate)", data=pdf_bytes, file_name=fname,
-                                              mime="application/pdf", base=f"pdf_{chosen_species.replace(' ','_')}")
-                                except Exception as e:
-                                    right_col.error(f"Could not create immediate download button: {e}")
-
-                            except Exception as e:
-                                right_col.error(f"PDF creation failed: {e}")
-                                right_col.info("Common cause: missing kaleido or reportlab in the Python environment that runs Streamlit.")
-                                right_col.info("Install in the same interpreter and restart Streamlit (run the install commands in the terminal used to start Streamlit).")
-                            finally:
-                                pdf_loading.empty()
-
-
-
-                    except Exception as e:
-                        right_col.error(f"Failed to create PDF: {e}")
-
-
-
-        except Exception as e:
-            loader.empty()
-            left_col.error(f"Failed to fetch OBIS data: {e}")
-
-    else:
-        # LLM decided to answer directly
-        ai_query = decision.get("query") or user_input
-        right_col.markdown("### AI Response")
-        right_col.markdown("<div class='muted'>AI interpreted your input as a question — here's the answer.</div>", unsafe_allow_html=True)
-        system_msg = {"role":"system","content":"You are a marine biology data assistant. Answer clearly and concisely."}
-        user_msg = {"role":"user","content":f"User input: {ai_query}"}
-        try:
-            with st.spinner("AI thinking..."):
-                reply = ask_openrouter([system_msg, user_msg])
-            right_col.markdown(reply)
-        except Exception as e:
-            right_col.error(f"AI request failed: {e}")
-
-# If a PDF was generated earlier in this session, show a persistent download button
 if st.session_state.get("last_pdf"):
     try:
         pdf_bytes = st.session_state["last_pdf"]
-        # Accept either bytes or BytesIO-like objects
-        if isinstance(pdf_bytes, (bytes, bytearray)):
-            pdf_data = pdf_bytes
-        else:
-            # e.g., io.BytesIO
-            try:
-                pdf_data = pdf_bytes.getvalue()
-            except Exception:
-                pdf_data = bytes(pdf_bytes)
-
-        pdf_name = st.session_state.get("last_pdf_name", "obis_report.pdf")
-        st.markdown("### Last generated PDF")
-        # create a stable unique key for the download button to avoid widget collisions
-        key = _make_dl_key("last_pdf", pdf_name)
-        st.download_button(
-            "Download last generated PDF",
-            data=pdf_data,
-            file_name=pdf_name,
-            mime="application/pdf",
-            key=key,
-        )
+        fname = st.session_state.get("last_pdf_name","obis_report.pdf")
+        key = _make_dl_key("last_pdf", fname)
+        st.download_button("Download last generated PDF", data=pdf_bytes, file_name=fname, mime="application/pdf", key=key)
     except Exception as e:
-        st.warning(f"PDF available but download button failed: {e}")
+        st.warning(f"PDF available but download failed: {e}")
 
-# --- Trigger NetCDF creation and show plots (paste near data display area) ---
+# ----------- PROCESS SUBMISSION -----------
+if submitted and query.strip():
+    # If user asks generic question (not a name), answer via AI and return.
+    if len(query.split()) >= 5 and not looks_binomial(query):
+        with right:
+            st.markdown("### AI Response")
+            with st.spinner("AI thinking..."):
+                reply = ask_openrouter([{"role":"system","content":"You are a marine biology data assistant. Answer clearly."},
+                                        {"role":"user","content":query}])
+            st.markdown(reply)
+    else:
+        with st.spinner("Resolving name..."):
+            sci, prov = resolve_common_to_scientific(query)
+        left.markdown(f"<div class='chip'>Resolved: <b>{sci}</b> <span class='muted'>(via {prov})</span></div>", unsafe_allow_html=True)
+        add_to_history(query, sci, prov)
+        if st.button(f"⭐ Bookmark {sci}", key=f"bm_{sci}"):
+            bookmark_current(sci); st.success("Bookmarked!")
+
+        with st.spinner("Fetching OBIS records..."):
+            bbox = None
+            if st.session_state.get("bbox_enable", bbox_enable):
+                bbox = {"lonmin": lon_min, "lonmax": lon_max, "latmin": lat_min, "latmax": lat_max}
+            df = fetch_obis_records(sci, size=max_records, bbox=bbox)
+
+        # Date filter
+        if not df.empty and "eventDate" in df.columns:
+            try:
+                df["eventDate"] = pd.to_datetime(df["eventDate"], errors="coerce")
+                if start_date: df = df[df["eventDate"] >= pd.to_datetime(start_date)]
+                if end_date: df = df[df["eventDate"] <= pd.to_datetime(end_date)]
+            except Exception:
+                pass
+
+        if df.empty:
+            left.warning(f"No records found for '{sci}' with current filters.")
+        else:
+            keep = [c for c in ["scientificName","eventDate","decimalLongitude","decimalLatitude","depth","basisOfRecord","institutionCode"] if c in df.columns]
+            df_clean = df[keep].copy() if keep else df.copy()
+            save_df(df_clean, "obis")
+            st.session_state["last_species"] = sci
+
+            left.success(f"Found {len(df_clean)} records for '{sci}'")
+            c1, c2, c3 = left.columns([1,1,2])
+            with c1: left.markdown(f"<div class='stat'><b>{len(df_clean)}</b><div class='small muted'>records</div></div>", unsafe_allow_html=True)
+            with c2:
+                pts = df_clean.dropna(subset=["decimalLongitude","decimalLatitude"]).shape[0]
+                left.markdown(f"<div class='stat'><b>{pts}</b><div class='small muted'>geo points</div></div>", unsafe_allow_html=True)
+            with c3:
+                rng = "-"
+                if "eventDate" in df_clean.columns and df_clean["eventDate"].notna().any():
+                    mn, mx = df_clean["eventDate"].min(), df_clean["eventDate"].max()
+                    rng = f"{mn.date()} → {mx.date()}"
+                left.markdown(f"<div class='small muted'>Date range: {rng}</div>", unsafe_allow_html=True)
+
+            figs = make_plots_from_df(df_clean, sci)
+            if "map" in figs: left.plotly_chart(figs["map"], use_container_width=True)
+            row1 = left.columns(2)
+            if "yearly" in figs: row1[0].plotly_chart(figs["yearly"], use_container_width=True)
+            if "monthly" in figs: row1[1].plotly_chart(figs["monthly"], use_container_width=True)
+            row2 = left.columns(2)
+            if "depth_hist" in figs: row2[0].plotly_chart(figs["depth_hist"], use_container_width=True)
+            if "density" in figs: row2[1].plotly_chart(figs["density"], use_container_width=True)
+
+            left.markdown("#### Sample records")
+            left.dataframe(df_clean.head(200))
+
+            # Downloads
+            try:
+                csv_str = prepare_csv_download(df_clean)
+                xlsx_bytes = prepare_excel_download(df_clean)
+                sp_key = sci.replace(" ", "_").replace("/", "_")
+                dl_button(left, "Download fetched CSV", csv_str, f"{sp_key}_obis.csv", "text/csv", base=f"fetched_{sp_key}")
+                dl_button(left, "Download fetched Excel", xlsx_bytes, f"{sp_key}_obis.xlsx",
+                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", base=f"fetched_{sp_key}")
+            except Exception:
+                csv_str = prepare_csv_download(df_clean)
+                sp_key = sci.replace(" ", "_").replace("/", "_")
+                dl_button(left, "Download fetched CSV", csv_str, f"{sp_key}_obis.csv", "text/csv", base=f"fetched_{sp_key}_fallback")
+
+            if auto_summary:
+                with right:
+                    st.markdown("### AI Summary (auto)")
+                    with st.spinner("Summarizing..."):
+                        summary = ai_summarize_records(df_clean, sci)
+                    st.session_state["last_summary"] = summary
+                    st.markdown(summary)
+                    # Auto-generate PDF
+                    try:
+                        figs_local = make_plots_from_df(df_clean, sci)
+                        pdf_bytes = generate_pdf_report(df_clean, sci, summary, figs_local)
+                        fname = f"{sci.replace(' ','_')}_auto_report.pdf"
+                        st.session_state["last_pdf"] = pdf_bytes
+                        st.session_state["last_pdf_name"] = fname
+                        _auto_download_pdf_bytes(pdf_bytes, fname)
+                    except Exception as e:
+                        st.info(f"PDF auto-download skipped: {e}")
+
+            with right:
+                st.markdown("### Ask AI about this dataset")
+                ai_q = st.text_area("Question about current dataset", key="data_ai_input_current", height=120)
+                if st.button("Ask AI about data", key="ask_ai_current"):
+                    sample = df_clean.head(30).to_dict(orient="records")
+                    parts = [f"Sample (<=30 rows): {sample}"]
+                    if st.session_state.get("last_summary"):
+                        parts.append(f"Existing AI summary: {st.session_state['last_summary']}")
+                    parts.append(f"Question: {ai_q or '[NO QUESTION]'}")
+                    with st.spinner("AI analyzing..."):
+                        ans = ask_openrouter([{"role":"system","content":"You are a helpful marine data assistant. Be concise."},
+                                              {"role":"user","content":"\n\n".join(parts)}])
+                    st.session_state.setdefault("data_ai_history", []).append({"q": ai_q, "a": ans, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")})
+                    st.session_state["last_summary"] = ans
+                    st.markdown("**AI answer:**"); st.markdown(ans)
+
+# ----------- SYNTHETIC NETCDF ACTIONS -----------
 if gen_enable:
     depths = [float(x.strip()) for x in nc_depths_str.split(",") if x.strip()]
     if st.button("Generate NetCDF and plots"):
         tmpf = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
-        tmp_path = tmpf.name
-        tmpf.close()
+        tmp_path = tmpf.name; tmpf.close()
         ds = generate_ocean_netcdf(tmp_path,
-                                  lon_min=lon_min, lon_max=lon_max,
-                                  lat_min=lat_min, lat_max=lat_max,
-                                  nx=nc_nx, ny=nc_ny, nt=nc_nt,
-                                  start_date=start_date, depths=np.array(depths),
-                                  variables=nc_vars)
-        st.success(f"NetCDF created: {tmp_path} (dataset dims: {ds.dims})")
-        # Download button using your dl_button wrapper
+                                   lon_min=locals().get("lon_min", 68.0), lon_max=locals().get("lon_max", 96.0),
+                                   lat_min=locals().get("lat_min", 6.0),  lat_max=locals().get("lat_max", 24.0),
+                                   nx=nc_nx, ny=nc_ny, nt=nc_nt,
+                                   start_date=start_date, depths=np.array(depths), variables=nc_vars)
+        st.success(f"NetCDF created: {tmp_path} (dims: {ds.dims})")
         with open(tmp_path, "rb") as fh:
             data = fh.read()
-        dl_button(st, "Download NetCDF", data, file_name="floatchat_ocean.nc", mime="application/x-netcdf")
-        # Show quick plots
-        fig_map = plot_variable_map_from_ds(ds, var=nc_vars[0], time_index=0, depth_index=0)
-        if fig_map:
-            st.plotly_chart(fig_map, use_container_width=True)
-        fig_profile = plot_variable_profile_at_point(ds, var=nc_vars[0], lon_val=None, lat_val=None, time_index=0)
-        if fig_profile:
-            st.plotly_chart(fig_profile, use_container_width=True)
-        fig_ts = plot_variable_timeseries_at_point(ds, var=nc_vars[0], lon_val=None, lat_val=None, depth_index=0)
-        if fig_ts:
-            st.plotly_chart(fig_ts, use_container_width=True)
+        dl_button(st, "Download NetCDF", data, "floatchat_ocean.nc", "application/x-netcdf")
+        f1 = plot_variable_map_from_ds(ds, var=nc_vars[0], time_index=0, depth_index=0); 
+        if f1: st.plotly_chart(f1, use_container_width=True)
+        f2 = plot_variable_profile_at_point(ds, var=nc_vars[0], time_index=0); 
+        if f2: st.plotly_chart(f2, use_container_width=True)
+        f3 = plot_variable_timeseries_at_point(ds, var=nc_vars[0], depth_index=0); 
+        if f3: st.plotly_chart(f3, use_container_width=True)
 
+# ----------- HISTORY & BOOKMARKS -----------
+with st.expander("Saved searches & bookmarks"):
+    hist = st.session_state.get("search_history", [])
+    if hist:
+        st.markdown("**Recent searches:**")
+        for h in reversed(hist[-10:]):
+            st.markdown(f"- `{h['q']}` → **{h['sci']}** <span class='small muted'>({h['prov']}, {h['t']})</span>", unsafe_allow_html=True)
+    if st.session_state.get("bookmarks"):
+        st.markdown("**Bookmarks:**")
+        st.write(", ".join([f"`{b}`" for b in st.session_state["bookmarks"]]))
 
-
-# Footer
+# ----------- FOOTER -----------
 st.markdown("---")
-st.markdown("<div class='small muted'>Data: OBIS (api.obis.org) • LLM: OpenRouter • Created by Pushpal Sanyal</div>", unsafe_allow_html=True)
+st.markdown("<div class='small muted'>Data: OBIS (api.obis.org) • ERDDAP • Geocoding: Nominatim • LLM: OpenRouter</div>", unsafe_allow_html=True)
 st.markdown("<div class='muted small'>Last updated: " + datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC") + "</div>", unsafe_allow_html=True)
