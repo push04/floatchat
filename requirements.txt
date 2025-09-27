@@ -1,14 +1,29 @@
-streamlit>=1.18
-requests
-pandas
-plotly
-kaleido
-reportlab
-openpyxl
-matplotlib
-plotly.express
-xarray
-netcdf4
-dask
-motuclient
-geopy
+# requirements.txt
+
+# App/UI
+streamlit>=1.32.0
+
+# HTTP
+requests>=2.31.0
+
+# Data
+pandas>=2.2.2
+numpy>=1.26.4
+
+# Visualization
+plotly>=5.20.0
+kaleido==0.2.1       # required for plotly.io.to_image (PDF charts)
+
+# Export
+reportlab>=4.0.9     # PDF generation
+openpyxl>=3.1.2      # Excel export
+
+# Earth & science
+xarray>=2024.1.0
+netCDF4>=1.6.5
+
+# Geocoding (Nominatim)
+geopy>=2.4.1
+
+# Optional: load OPENROUTER_API_KEY from .env during local dev
+python-dotenv>=1.0.1
